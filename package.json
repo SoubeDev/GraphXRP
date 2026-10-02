@@ -1,0 +1,21 @@
+{
+  "name": "graphxrp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "An Obsidian-style interactive graph explorer for the XRP Ledger",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "d3-force": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/d3-force": "^3.0.10",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.2"
+  }
+}
