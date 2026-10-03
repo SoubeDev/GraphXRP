@@ -11,19 +11,24 @@ const RIPPLE_EPOCH = 946684800;
 
 export const rippleTimeToMs = (t: number) => (t + RIPPLE_EPOCH) * 1000;
 
-export function parseAmount(a: unknown): Amt | null {
+/**
+ * `native` is the network's own currency (XRP on the XRP Ledger, XAH on Xahau);
+ * `isXrp` means "the native currency" whichever network it is. `id` maps issuer
+ * addresses to graph ids on networks other than the XRP Ledger.
+ */
+export function parseAmount(a: unknown, native = 'XRP', id: (addr: string) => string = (x) => x): Amt | null {
   if (a == null) return null;
   if (typeof a === 'string' || typeof a === 'number') {
     const drops = Number(a);
     if (!Number.isFinite(drops)) return null;
-    return { value: drops / 1e6, currency: 'XRP', isXrp: true };
+    return { value: drops / 1e6, currency: native, isXrp: true };
   }
   if (typeof a === 'object') {
     const o = a as Record<string, string>;
     if (o.mpt_issuance_id) return { value: Number(o.value), currency: 'MPT', isXrp: false };
     if (o.currency) {
-      if (o.currency === 'XRP') return { value: Number(o.value ?? 0), currency: 'XRP', isXrp: true };
-      return { value: Number(o.value), currency: decodeCurrency(o.currency), issuer: o.issuer, isXrp: false };
+      if (o.currency === 'XRP') return { value: Number(o.value ?? 0), currency: native, isXrp: true };
+      return { value: Number(o.value), currency: decodeCurrency(o.currency), issuer: o.issuer ? id(o.issuer) : undefined, isXrp: false };
     }
   }
   return null;

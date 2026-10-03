@@ -53,6 +53,9 @@ export class XrplClient {
   private watchdog = 0;
   /** Servers that told us to back off, and until when. */
   private throttled = new Map<string, number>();
+  /** Accounts whose validated transactions are streamed to `txListeners`. */
+  private accounts = new Set<string>();
+  private txListeners = new Set<(msg: any) => void>();
 
   constructor(servers: string[] = DEFAULT_SERVERS) {
     this.servers = servers;
@@ -61,6 +64,23 @@ export class XrplClient {
   onChange(fn: () => void): () => void {
     this.listeners.add(fn);
     return () => this.listeners.delete(fn);
+  }
+
+  /** Raw `transaction` stream messages for the watched accounts (validated only). */
+  onTransaction(fn: (msg: any) => void): () => void {
+    this.txListeners.add(fn);
+    return () => this.txListeners.delete(fn);
+  }
+
+  /** Replace the set of accounts to stream. Survives reconnects and failover. */
+  watchAccounts(list: Iterable<string>) {
+    const next = new Set(list);
+    const add = [...next].filter((a) => !this.accounts.has(a));
+    const remove = [...this.accounts].filter((a) => !next.has(a));
+    this.accounts = next;
+    if (this.ws?.readyState !== WebSocket.OPEN) return; // subscribed on open
+    if (add.length) this.sendRaw({ id: 'acct', command: 'subscribe', accounts: add });
+    if (remove.length) this.sendRaw({ id: 'acct', command: 'unsubscribe', accounts: remove });
   }
 
   private emit() {
@@ -155,6 +175,7 @@ export class XrplClient {
       this.state = 'connected';
       this.emit();
       this.sendRaw({ id: 'sub', command: 'subscribe', streams: ['ledger'] });
+      if (this.accounts.size) this.sendRaw({ id: 'acct', command: 'subscribe', accounts: [...this.accounts] });
       this.armWatchdog();
       this.pump();
     };
@@ -211,6 +232,10 @@ export class XrplClient {
     try {
       msg = JSON.parse(raw);
     } catch {
+      return;
+    }
+    if (msg.type === 'transaction') {
+      if (msg.validated) for (const fn of this.txListeners) fn(msg);
       return;
     }
     if (msg.type === 'ledgerClosed') {

@@ -4,6 +4,8 @@ import type { NodeKind } from './graph/model';
 export interface Settings {
   edgeTypes: Record<EdgeType, boolean>;
   kinds: Record<NodeKind, boolean>;
+  /** Networks switched off in the legend (missing = shown). */
+  chains: Record<string, boolean>;
   showStubs: boolean;
   showOrphans: boolean;
   currency: string;
@@ -22,8 +24,9 @@ export interface Settings {
 }
 
 export const DEFAULTS: Settings = {
-  edgeTypes: { payment: true, activation: true, trust: true, dex: true, control: true, crosschain: true },
-  kinds: { issuer: true, exchange: true, amm: true, bridge: true, wallet: true, external: true, flagged: true, inactive: true },
+  edgeTypes: { payment: true, activation: true, trust: true, dex: true, control: true, crosschain: true, contract: true },
+  kinds: { issuer: true, exchange: true, amm: true, bridge: true, contract: true, wallet: true, external: true, flagged: true, inactive: true },
+  chains: {},
   showStubs: true,
   showOrphans: false,
   currency: '',
@@ -51,6 +54,7 @@ export function loadSettings(): Settings {
       ...raw,
       edgeTypes: { ...DEFAULTS.edgeTypes, ...raw.edgeTypes },
       kinds: { ...DEFAULTS.kinds, ...raw.kinds },
+      chains: { ...raw.chains },
       currency: '',
     };
   } catch {

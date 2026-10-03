@@ -5,6 +5,7 @@ import { buildTopBar } from './ui/chrome';
 import { Inspector } from './ui/inspector';
 import { buildLegend, buildSettings, buildZoom } from './ui/panels';
 import { buildContextMenu, buildHelp, buildToasts, buildTooltip, buildWelcome } from './ui/overlays';
+import { hasWalletApi } from './wallets/probe';
 
 const root = document.getElementById('app')!;
 const stage = h('div', { class: 'stage' });
@@ -52,6 +53,11 @@ document.addEventListener('keydown', (e) => {
 });
 
 app.routeFromHash();
+
+// Your wallets: only when running locally with the wallet API. Loaded on demand, so the public site never loads it.
+void hasWalletApi().then((ok) => {
+  if (ok) import('./wallets').then((m) => m.mount(app, root)).catch((e) => console.error('Wallets failed to load:', e));
+});
 
 // Handy for poking around from the browser console during development.
 if (import.meta.env.DEV) (window as unknown as { app: App }).app = app;

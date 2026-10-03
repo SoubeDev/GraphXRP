@@ -91,6 +91,9 @@ const STATIC_DOORS: Record<string, BridgeId> = {
   rLcxBUrZESqHnruY4fX7GQthRjDCDSAWia: 'orbit',
   rKoePMg1MnWu19E38fqUji4eX6qNgdoTAr: 'xpr',
   rDsvn6aJG4YMQdHnuJtP9NLrFp18JYTJUf: 'multichain',
+  // The same bridges' accounts on connected networks.
+  'ext:xahau:rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge': 'teleport',
+  'ext:xrpl-evm:0xb5fb4be02232b1bba4dc8f81dc24c26980de9e3c': 'axelar',
 };
 
 /** Directory entries (name + domain) that identify more door accounts, e.g. Wanchain's 25 wallets. */
@@ -139,6 +142,7 @@ function fromDirectory(addr: string): BridgeId | undefined {
 /* ------------------------------------------------------------------ */
 
 const CHAIN_NAMES: Record<string, string> = {
+  xrpl: 'XRP Ledger',
   'xrpl-evm': 'XRPL EVM Sidechain',
   ethereum: 'Ethereum',
   flare: 'Flare',

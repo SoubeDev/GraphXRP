@@ -5,6 +5,8 @@ import { h, clear } from './dom';
 import { icon, shapeGlyph, lineGlyph } from './icons';
 import { edgeCurrencies } from '../graph/view';
 import { DEFAULTS, type Settings } from '../settings';
+import { NETWORKS, isNetwork } from '../chains/chains';
+import { chainName } from '../bridges/registry';
 import type { NodeKind } from '../graph/model';
 import type { EdgeType } from '../xrpl/parse';
 
@@ -15,6 +17,7 @@ export const EDGE_LABEL: Record<EdgeType, string> = {
   dex: 'Traded with (DEX / AMM)',
   control: 'Can sign for',
   crosschain: 'Crossed to another chain',
+  contract: 'Used a smart contract',
 };
 
 export const EDGE_HINT: Record<EdgeType, string> = {
@@ -23,13 +26,15 @@ export const EDGE_HINT: Record<EdgeType, string> = {
   trust: 'The holder opted in to hold a token created by the issuer (arrow points at the issuer).',
   dex: 'Their orders matched on the built-in exchange, or one traded with an AMM pool.',
   control: 'The first account holds a key that can sign transactions for the second.',
-  crosschain: 'The transaction names a destination (or source) on another blockchain, usually through a bridge. It\u2019s declared in the XRP Ledger transaction; arrival on the other chain isn\u2019t verified here.',
+  crosschain: 'Funds moving to (or from) another network, usually through a bridge. Dashed: declared in the transaction. Solid: confirmed on the other network. It\u2019s declared in the XRP Ledger transaction; arrival on the other chain isn\u2019t verified here.',
+  contract: 'One account called a program (smart contract) on the XRPL EVM Sidechain, for example a token or a bridge.',
 };
 
-const KINDS: NodeKind[] = ['exchange', 'issuer', 'amm', 'bridge', 'wallet', 'external', 'flagged', 'inactive'];
-const EDGES: EdgeType[] = ['payment', 'activation', 'trust', 'dex', 'control', 'crosschain'];
+const KINDS: NodeKind[] = ['exchange', 'issuer', 'amm', 'bridge', 'contract', 'wallet', 'external', 'flagged', 'inactive'];
+const EDGES: EdgeType[] = ['payment', 'activation', 'trust', 'dex', 'control', 'crosschain', 'contract'];
 /** Shown in the legend only once something of that kind is on the map. */
-const OPTIONAL_KINDS = new Set<NodeKind>(['external', 'flagged', 'inactive']);
+const OPTIONAL_KINDS = new Set<NodeKind>(['contract', 'external', 'flagged', 'inactive']);
+const OPTIONAL_EDGES = new Set<EdgeType>(['contract']);
 
 export function buildLegend(app: App, toggleSettings: () => void): HTMLElement {
   const el = h('div', { class: 'legend panel', role: 'region', 'aria-label': 'Legend and filters' });
@@ -38,6 +43,8 @@ export function buildLegend(app: App, toggleSettings: () => void): HTMLElement {
     clear(el);
     const counts = new Map<string, number>();
     for (const n of app.model.nodes.values()) if (!n.hidden) counts.set(n.kind, (counts.get(n.kind) ?? 0) + 1);
+    const ncounts = new Map<string, number>();
+    for (const n of app.model.nodes.values()) if (!n.hidden) ncounts.set(n.chain, (ncounts.get(n.chain) ?? 0) + 1);
     const ecounts = new Map<string, number>();
     for (const e of app.model.edges.values()) ecounts.set(e.type, (ecounts.get(e.type) ?? 0) + 1);
 
@@ -65,7 +72,7 @@ export function buildLegend(app: App, toggleSettings: () => void): HTMLElement {
         h('span', { class: 'lg-count' }, String(counts.get(k) ?? 0)),
       );
     });
-    const edgeRows = EDGES.map((t) => {
+    const edgeRows = EDGES.filter((t) => !OPTIONAL_EDGES.has(t) || (ecounts.get(t) ?? 0) > 0).map((t) => {
       const on = app.settings.edgeTypes[t];
       return h(
         'button',
@@ -80,7 +87,29 @@ export function buildLegend(app: App, toggleSettings: () => void): HTMLElement {
         h('span', { class: 'lg-count' }, String(ecounts.get(t) ?? 0)),
       );
     });
+    const netRows =
+      ncounts.size > 1
+        ? [...ncounts.entries()]
+            .sort((a, b) => (a[0] === 'xrpl' ? -1 : b[0] === 'xrpl' ? 1 : (isNetwork(b[0]) ? 1 : 0) - (isNetwork(a[0]) ? 1 : 0) || b[1] - a[1]))
+            .map(([chain, count]) => {
+              const on = app.settings.chains[chain] !== false;
+              const name = isNetwork(chain) ? NETWORKS[chain].name : chainName(chain);
+              return h(
+                'button',
+                {
+                  class: `legend-row${on ? '' : ' off'}`,
+                  title: `${isNetwork(chain) ? NETWORKS[chain].blurb : 'Not connected: only XRP Ledger transactions that point here are known.'}\nClick to ${on ? 'hide' : 'show'}.`,
+                  'aria-pressed': String(on),
+                  onclick: () => app.updateSettings({ chains: { ...app.settings.chains, [chain]: !on } }, { refresh: true }),
+                },
+                h('span', { class: `net-dot${isNetwork(chain) ? '' : ' off-net'}`, 'aria-hidden': 'true' }),
+                h('span', { class: 'lg-label' }, name),
+                h('span', { class: 'lg-count' }, String(count)),
+              );
+            })
+        : [];
     el.append(
+      netRows.length ? h('div', { class: 'legend-group' }, h('div', { class: 'lg-title' }, 'Networks'), ...netRows) : '',
       h('div', { class: 'legend-group' }, h('div', { class: 'lg-title' }, 'Accounts'), ...kindRows),
       h('div', { class: 'legend-group' }, h('div', { class: 'lg-title' }, 'Lines'), ...edgeRows),
       h(
@@ -103,8 +132,12 @@ export function buildSettings(app: App): { el: HTMLElement; toggle: () => void }
   const toggle = () => {
     open = !open;
     el.classList.toggle('open', open);
-    if (open) render();
+    if (open) {
+      render();
+      app.emit('panel', 'settings');
+    }
   };
+  app.on('panel', (p) => p !== 'settings' && open && toggle());
 
   const slider = (label: string, key: keyof Settings, min: number, max: number, step: number, opts: { forces?: boolean; refresh?: boolean; hint?: string } = {}) => {
     const val = h('span', { class: 'sl-val' }, String(app.settings[key]));

@@ -7,6 +7,8 @@ import { forceCollide, forceLink, forceManyBody, forceSimulation, forceX, forceY
 import type { GEdge, GNode, GraphModel, NodeKind } from './model';
 import type { EdgeType } from '../xrpl/parse';
 import type { Settings } from '../settings';
+import { NETWORKS, isNetwork } from '../chains/chains';
+import { chainName } from '../bridges/registry';
 
 export interface Palette {
   bg: string;
@@ -33,6 +35,7 @@ export const EDGE_DASH: Record<EdgeType, number[]> = {
   dex: [5, 4],
   control: [7, 3, 2, 3],
   crosschain: [9, 4],
+  contract: [2, 3],
 };
 
 const FLOW_TYPES = new Set<EdgeType>(['payment', 'activation', 'crosschain']);
@@ -58,6 +61,8 @@ export class GraphView {
   cam = { x: 0, y: 0, k: 1 };
   /** Pixels on the right covered by the inspector; camera centers in the remaining space. */
   insetRight = 0;
+  /** Pixels on the left covered by a side drawer (wallets). */
+  insetLeft = 0;
   /** Pixels at the bottom covered by the inspector's bottom sheet on phones. */
   insetBottom = 0;
 
@@ -136,12 +141,43 @@ export class GraphView {
 
   applyForces() {
     const s = this.settings;
+    const crossing = (e: GEdge) => e.source.chain !== e.target.chain;
     this.link
-      .distance((e) => s.linkDistance * (e.type === 'trust' ? 1.2 : 1) + e.source.r + e.target.r)
-      .strength((e) => s.linkForce / Math.max(1, Math.min(e.source.degree, e.target.degree)));
+      // Links between networks are long and loose so each network keeps its own island.
+      .distance((e) => (crossing(e) ? s.linkDistance * 4 + 160 : s.linkDistance * (e.type === 'trust' ? 1.2 : 1)) + e.source.r + e.target.r)
+      .strength((e) => (crossing(e) ? 0.02 : s.linkForce / Math.max(1, Math.min(e.source.degree, e.target.degree))));
     this.charge.strength((n) => -s.repelForce * 22 * (0.7 + n.r / 14));
-    (this.sim.force('x') as ReturnType<typeof forceX<GNode>>).strength(s.centerForce * 0.08);
-    (this.sim.force('y') as ReturnType<typeof forceY<GNode>>).strength(s.centerForce * 0.08);
+    const pull = (n: GNode) => (this.anchors.size > 1 && n.chain !== 'xrpl' ? Math.max(0.06, s.centerForce * 0.14) : s.centerForce * 0.08);
+    (this.sim.force('x') as ReturnType<typeof forceX<GNode>>).x((n) => this.anchor(n).x).strength(pull);
+    (this.sim.force('y') as ReturnType<typeof forceY<GNode>>).y((n) => this.anchor(n).y).strength(pull);
+  }
+
+  /** Where each network's island sits: the XRP Ledger in the middle, others around it. */
+  private anchors = new Map<string, { x: number; y: number }>();
+
+  private anchor(n: GNode) {
+    return this.anchors.get(n.chain) ?? { x: 0, y: 0 };
+  }
+
+  private placeIslands(nodes: GNode[]) {
+    const chains = [...new Set(nodes.map((n) => n.chain))];
+    const order = (c: string) => (c === 'xrpl' ? 0 : isNetwork(c) ? 1 : 2);
+    chains.sort((a, b) => order(a) - order(b) || a.localeCompare(b));
+    const next = new Map<string, { x: number; y: number }>();
+    if (chains.length > 1) {
+      const R = 620 + this.settings.linkDistance * 3;
+      const connected = chains.filter((c) => c !== 'xrpl' && isNetwork(c));
+      const others = chains.filter((c) => !isNetwork(c));
+      const fan = (list: string[], center: number, spread: number) =>
+        list.forEach((c, i) => {
+          const a = center + (list.length > 1 ? (i / (list.length - 1) - 0.5) * spread : 0);
+          next.set(c, { x: Math.cos(a) * R, y: Math.sin(a) * R });
+        });
+      next.set('xrpl', { x: 0, y: 0 });
+      fan(connected, 0, Math.PI * 0.55); // to the right
+      fan(others, Math.PI, Math.min(Math.PI * 0.9, others.length * 0.35)); // to the left
+    }
+    this.anchors = next;
   }
 
   reheat(alpha = 0.6) {
@@ -159,6 +195,7 @@ export class GraphView {
       const forced = n.id === sel || inTrail(n.id);
       if (n.hidden && !forced) continue;
       if (!s.kinds[n.kind] && !forced) continue;
+      if (s.chains[n.chain] === false && !forced) continue;
       if (!s.showStubs && n.state === 'stub' && !forced) continue;
       candidates.set(n.id, n);
     }
@@ -197,6 +234,7 @@ export class GraphView {
 
     this.nodes = nodes;
     this.edges = edges;
+    this.placeIslands(nodes);
     this.sim.nodes(nodes);
     this.link.links(edges);
     this.applyForces();
@@ -217,7 +255,7 @@ export class GraphView {
   /* ------------------------------ camera ------------------------------ */
 
   private center() {
-    return { cx: (this.w - this.insetRight) / 2, cy: (this.h - this.insetBottom) / 2 };
+    return { cx: this.insetLeft + (this.w - this.insetLeft - this.insetRight) / 2, cy: (this.h - this.insetBottom) / 2 };
   }
 
   flyTo(wx: number, wy: number, k = this.cam.k, dur = 650) {
@@ -245,7 +283,7 @@ export class GraphView {
       x1 = Math.max(x1, n.x! + n.r);
       y1 = Math.max(y1, n.y! + n.r);
     }
-    const vw = Math.max(100, this.w - this.insetRight - pad * 2);
+    const vw = Math.max(100, this.w - this.insetLeft - this.insetRight - pad * 2);
     const vh = Math.max(100, this.h - this.insetBottom - pad * 2);
     const k = Math.min(vw / Math.max(1, x1 - x0), vh / Math.max(1, y1 - y0), 2.2);
     this.flyTo((x0 + x1) / 2, (y0 + y1) / 2, k);
@@ -563,6 +601,30 @@ export class GraphView {
     const sel = this.selected;
     const t = now / 1000;
 
+    /* network islands: a soft disc behind each network's accounts */
+    const islands: { chain: string; x: number; y: number; r: number }[] = [];
+    if (this.anchors.size > 1) {
+      const groups = new Map<string, GNode[]>();
+      for (const n of this.nodes) (groups.get(n.chain) ?? groups.set(n.chain, []).get(n.chain)!).push(n);
+      for (const [chain, list] of groups) {
+        const cx = list.reduce((sum, n) => sum + n.x!, 0) / list.length;
+        const cy = list.reduce((sum, n) => sum + n.y!, 0) / list.length;
+        const r = Math.max(60, ...list.map((n) => Math.hypot(n.x! - cx, n.y! - cy) + n.r)) + 30;
+        islands.push({ chain, x: cx, y: cy, r });
+        ctx.globalAlpha = isNetwork(chain) ? 0.045 : 0.025;
+        ctx.fillStyle = P.text;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 0.14;
+        ctx.strokeStyle = P.textMuted;
+        ctx.lineWidth = 1 / k;
+        ctx.setLineDash(isNetwork(chain) ? [] : [4 / k, 4 / k]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
     /* edges */
     ctx.lineCap = 'round';
     const particleEdges: { e: GEdge; a: number; lw: number; trail: boolean }[] = [];
@@ -594,7 +656,8 @@ export class GraphView {
       ctx.globalAlpha = a;
       ctx.strokeStyle = inTrail ? P.accent : P.edge[e.type];
       ctx.lineWidth = lw;
-      const dash = EDGE_DASH[e.type];
+      // Cross-chain links confirmed on the other network are drawn solid; declared ones stay dashed.
+      const dash = e.type === 'crosschain' && e.confirmed.size > 0 && e.confirmed.size >= e.seen.size ? [] : EDGE_DASH[e.type];
       if (inTrail) {
         ctx.setLineDash([6 / k, 4 / k]);
         ctx.lineDashOffset = -t * 28 / k;
@@ -766,6 +829,24 @@ export class GraphView {
       ctx.fillStyle = n.named || n.id === hoverId || n.id === sel ? P.text : P.textMuted;
       ctx.fillText(label, it.sx, it.sy);
     }
+    // Island names, at the top edge of each island.
+    if (islands.length) {
+      ctx.font = '600 11px system-ui, -apple-system, "Segoe UI", sans-serif';
+      ctx.textBaseline = 'bottom';
+      for (const isl of islands) {
+        const sx = isl.x * k + cam.x;
+        const sy = (isl.y - isl.r) * k + cam.y - 4;
+        if (sx < -200 || sx > this.w + 200 || sy < -20 || sy > this.h + 20) continue;
+        const name = isNetwork(isl.chain) ? NETWORKS[isl.chain].name : `${chainName(isl.chain)} · not connected`;
+        const text = name.toUpperCase().split('').join(' ');
+        ctx.globalAlpha = 0.9;
+        ctx.strokeStyle = P.bg;
+        ctx.lineWidth = 4;
+        ctx.strokeText(text, sx, sy);
+        ctx.fillStyle = P.textMuted;
+        ctx.fillText(text, sx, sy);
+      }
+    }
     ctx.globalAlpha = 1;
     return animating;
   }
@@ -791,7 +872,16 @@ export class GraphView {
   private shape(kind: NodeKind, x: number, y: number, r: number) {
     const ctx = this.ctx;
     ctx.beginPath();
-    if (kind === 'bridge' || kind === 'external') {
+    if (kind === 'contract') {
+      // A pentagon: code that runs on a smart-contract chain.
+      const d = r * 1.18;
+      for (let i = 0; i < 5; i++) {
+        const a = -Math.PI / 2 + (i * 2 * Math.PI) / 5;
+        if (i) ctx.lineTo(x + Math.cos(a) * d, y + Math.sin(a) * d);
+        else ctx.moveTo(x + Math.cos(a) * d, y + Math.sin(a) * d);
+      }
+      ctx.closePath();
+    } else if (kind === 'bridge' || kind === 'external') {
       // A triangle: a way out of the XRP Ledger (solid = door account here, hollow = the other side).
       const d = r * 1.4;
       ctx.moveTo(x, y - d);

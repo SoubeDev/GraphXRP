@@ -1,12 +1,16 @@
 /** Loads and caches everything we show about an account, straight from the ledger. */
 import { XrplClient, XrplError } from './client';
-import { parseTx, type ParsedTx } from './parse';
+import { parseTx, type Flow, type ParsedTx } from './parse';
 import { parseAmount, hexToAscii, decodeCurrency, type Amt } from './amount';
 import { F, has } from './flags';
+import { XRPL_CTX, rawAddress, type ChainCtx } from '../chains/chains';
 
 export interface TrustLine {
   peer: string;
   currency: string;
+  /** Currency code exactly as the ledger stores it (needed to send the token). */
+  code: string;
+  noRipple: boolean;
   /** > 0: this account holds the peer's token. < 0: the peer holds this account's token. */
   balance: number;
   limit: number;
@@ -31,7 +35,10 @@ export interface AmmPool {
 }
 
 export interface AccountData {
+  /** Graph id (plain r-address on the XRP Ledger, `ext:xahau:r…` on Xahau). */
   address: string;
+  chain: ChainCtx['chain'];
+  native: string;
   exists: boolean;
   balance: number;
   flags: number;
@@ -52,7 +59,8 @@ export interface AccountData {
 }
 
 const TX_PAGE = 200;
-const EARLIEST_LEDGER = 32570; // the oldest ledger whose history survives
+/** The oldest ledger whose history survives on each network. */
+const EARLIEST_LEDGER: Record<ChainCtx['chain'], number> = { xrpl: 32570, xahau: 1 };
 
 export function cleanDomain(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
@@ -83,7 +91,10 @@ export class Loader {
   /** Called when late-arriving details (like issued totals) are added to loaded data. */
   onUpdate?: (addr: string) => void;
 
-  constructor(private c: XrplClient) {}
+  constructor(
+    private c: XrplClient,
+    readonly ctx: ChainCtx = XRPL_CTX,
+  ) {}
 
   account(addr: string, force = false): Promise<AccountData> {
     const cached = this.accounts.get(addr);
@@ -99,10 +110,12 @@ export class Loader {
 
   private async load(addr: string): Promise<AccountData> {
     const c = this.c;
+    const ctx = this.ctx;
+    const raw = rawAddress(addr);
     const [infoR, linesR, txR, actR] = await Promise.allSettled([
-      this.accountRoot(addr),
-      c.request('account_lines', { account: addr, ledger_index: 'validated', limit: 200 }),
-      c.request('account_tx', { account: addr, ledger_index_min: -1, ledger_index_max: -1, limit: TX_PAGE, forward: false }),
+      this.accountRoot(raw),
+      c.request('account_lines', { account: raw, ledger_index: 'validated', limit: 200 }),
+      c.request('account_tx', { account: raw, ledger_index_min: -1, ledger_index_max: -1, limit: TX_PAGE, forward: false }),
       this.activation(addr),
     ]);
 
@@ -121,15 +134,17 @@ export class Loader {
 
     const data: AccountData = {
       address: addr,
+      chain: ctx.chain,
+      native: ctx.native,
       exists,
       balance: exists ? Number(info.Balance) / 1e6 : 0,
       flags: Number(info.Flags ?? 0),
       domain: info.Domain ? cleanDomain(hexToAscii(info.Domain)) : undefined,
-      regularKey: info.RegularKey,
+      regularKey: info.RegularKey ? ctx.id(info.RegularKey) : undefined,
       signers: signerList
         ? {
             quorum: signerList.SignerQuorum,
-            entries: (signerList.SignerEntries ?? []).map((e: any) => ({ account: e.SignerEntry.Account, weight: e.SignerEntry.SignerWeight })),
+            entries: (signerList.SignerEntries ?? []).map((e: any) => ({ account: ctx.id(e.SignerEntry.Account), weight: e.SignerEntry.SignerWeight })),
           }
         : undefined,
       transferRate: info.TransferRate ? (Number(info.TransferRate) / 1e9 - 1) * 100 : undefined,
@@ -145,8 +160,10 @@ export class Loader {
 
     if (linesR.status === 'fulfilled') {
       data.lines = (linesR.value.lines ?? []).map((l: any) => ({
-        peer: l.account,
+        peer: ctx.id(l.account),
         currency: decodeCurrency(l.currency),
+        code: l.currency,
+        noRipple: !!l.no_ripple,
         balance: Number(l.balance),
         limit: Number(l.limit),
         limitPeer: Number(l.limit_peer),
@@ -154,17 +171,17 @@ export class Loader {
       data.linesMore = !!linesR.value.marker;
     }
     if (txR.status === 'fulfilled') {
-      data.txs = (txR.value.transactions ?? []).map(parseTx);
+      data.txs = (txR.value.transactions ?? []).map((e: any) => parseTx(e, ctx));
       data.txMarker = txR.value.marker;
       data.txDone = !txR.value.marker;
     } else if (!exists) {
-      throw new XrplError('actNotFound', 'This address has never been used on the XRP Ledger.');
+      throw new XrplError('actNotFound', `This address has never been used on ${ctx.chain === 'xahau' ? 'Xahau' : 'the XRP Ledger'}.`);
     }
 
     // Issued-token totals can take a while for big issuers, so they fill in afterwards.
     const looksLikeIssuer = data.lines.some((l) => l.balance < 0) || has(data.flags, F.DefaultRipple);
     if (exists && looksLikeIssuer && !data.ammId) {
-      c.request('gateway_balances', { account: addr, ledger_index: 'validated', strict: true }, 30000)
+      c.request('gateway_balances', { account: raw, ledger_index: 'validated', strict: true }, 30000)
         .then((r) => {
           data.obligations = Object.entries(r.obligations ?? {})
             .map(([cur, v]) => ({ value: Number(v), currency: decodeCurrency(cur), issuer: addr, isXrp: false }))
@@ -202,7 +219,7 @@ export class Loader {
   probe(addr: string): Promise<Probe> {
     const cached = this.probes.get(addr);
     if (cached) return cached;
-    const p = this.accountRoot(addr, true)
+    const p = this.accountRoot(rawAddress(addr), true)
       .then(
         ({ root: i }): Probe => {
           return { exists: true, balance: Number(i.Balance) / 1e6, flags: Number(i.Flags ?? 0), ammId: i.AMMID, domain: i.Domain ? cleanDomain(hexToAscii(i.Domain)) : undefined };
@@ -226,12 +243,13 @@ export class Loader {
     const cached = this.amms.get(addr);
     if (cached) return cached;
     const p = this.c
-      .request('amm_info', { amm_account: addr, ledger_index: 'validated' }, 20000, low)
+      .request('amm_info', { amm_account: rawAddress(addr), ledger_index: 'validated' }, 20000, low)
       .then((r): AmmPool | null => {
         const a = r.amm;
-        const asset1 = parseAmount(a?.amount);
-        const asset2 = parseAmount(a?.amount2);
-        return asset1 && asset2 ? { asset1, asset2, feePct: Number(a.trading_fee ?? 0) / 1000, lp: parseAmount(a.lp_token) ?? undefined } : null;
+        const amt = (x: unknown) => parseAmount(x, this.ctx.native, this.ctx.id);
+        const asset1 = amt(a?.amount);
+        const asset2 = amt(a?.amount2);
+        return asset1 && asset2 ? { asset1, asset2, feePct: Number(a.trading_fee ?? 0) / 1000, lp: amt(a.lp_token) ?? undefined } : null;
       })
       .catch(() => null);
     this.amms.set(addr, p);
@@ -243,15 +261,19 @@ export class Loader {
     const cached = this.activations.get(addr);
     if (cached) return cached;
     const p = this.c
-      .request('account_tx', { account: addr, ledger_index_min: -1, ledger_index_max: -1, limit: 1, forward: true })
+      .request('account_tx', { account: rawAddress(addr), ledger_index_min: -1, ledger_index_max: -1, limit: 1, forward: true })
       .then((r): Activation => {
         const e = r.transactions?.[0];
         if (!e) return { unknown: 'none' };
-        const t = parseTx(e);
+        const t = parseTx(e, this.ctx);
+        if (t.type === 'Import' && t.account === addr) {
+          // Created on Xahau by importing from the XRP Ledger: the "parent" is the same address there.
+          return { parent: rawAddress(addr), date: t.date, amount: t.cross?.amount ?? null, hash: t.hash, via: 'Import' };
+        }
         if (t.created.includes(addr)) {
           return { parent: t.account, date: t.date, amount: t.type === 'Payment' ? t.delivered : null, hash: t.hash, via: t.type };
         }
-        return { unknown: Number(r.ledger_index_min) <= EARLIEST_LEDGER ? 'genesis' : 'history' };
+        return { unknown: Number(r.ledger_index_min) <= EARLIEST_LEDGER[this.ctx.chain] ? 'genesis' : 'history' };
       });
     this.activations.set(addr, p);
     p.catch(() => this.activations.delete(addr));
@@ -261,14 +283,14 @@ export class Loader {
   async moreTx(data: AccountData): Promise<ParsedTx[]> {
     if (data.txDone) return [];
     const r = await this.c.request('account_tx', {
-      account: data.address,
+      account: rawAddress(data.address),
       ledger_index_min: -1,
       ledger_index_max: -1,
       limit: TX_PAGE,
       forward: false,
       marker: data.txMarker,
     });
-    const page: ParsedTx[] = (r.transactions ?? []).map(parseTx);
+    const page: ParsedTx[] = (r.transactions ?? []).map((e: any) => parseTx(e, this.ctx));
     data.txs.push(...page);
     data.txMarker = r.marker;
     data.txDone = !r.marker;
@@ -277,7 +299,7 @@ export class Loader {
 
   async tx(hash: string): Promise<ParsedTx> {
     const r = await this.c.request('tx', { transaction: hash });
-    return parseTx(r);
+    return parseTx(r, this.ctx);
   }
 }
 
@@ -303,11 +325,15 @@ export interface FlowSummary {
 
 /** Aggregate who an account deals with, based on its loaded history. */
 export function summarize(data: AccountData): FlowSummary {
-  const me = data.address;
+  return summarizeFlows(data.address, data.txs);
+}
+
+/** Same, for anything with dated flows (also used for XRPL EVM activity). */
+export function summarizeFlows(me: string, items: { date: number; flows: Flow[] }[]): FlowSummary {
   const map = new Map<string, Counterparty>();
   let xrpIn = 0;
   let xrpOut = 0;
-  for (const t of data.txs) {
+  for (const t of items) {
     for (const f of t.flows) {
       if (f.from !== me && f.to !== me) continue;
       const other = f.from === me ? f.to : f.from;
@@ -327,14 +353,14 @@ export function summarize(data: AccountData): FlowSummary {
       }
     }
   }
-  const dates = data.txs.map((t) => t.date).filter(Boolean);
+  const dates = items.map((t) => t.date).filter(Boolean);
   return {
     counterparties: [...map.values()].sort((a, b) => score(b) - score(a)),
     xrpIn,
     xrpOut,
     from: dates.length ? Math.min(...dates) : 0,
     to: dates.length ? Math.max(...dates) : 0,
-    txCount: data.txs.length,
+    txCount: items.length,
   };
 }
 

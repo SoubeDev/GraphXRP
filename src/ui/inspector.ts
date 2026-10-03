@@ -3,19 +3,29 @@ import type { App, Trace } from '../app';
 import { KIND_HINT, KIND_LABEL } from '../app';
 import { h, clear, copyText } from './dom';
 import { icon, shapeGlyph } from './icons';
-import { summarize, type AccountData } from '../xrpl/loader';
-import { describe, type ParsedTx, type Seg } from '../xrpl/parse';
-import { BRIDGES, chainName, doorOf, explorerFor, isExternal, parseExt, shortForeign } from '../bridges/registry';
+import { summarize, summarizeFlows, type AccountData } from '../xrpl/loader';
+import { describe, describeCrossing, type Description, type Flow, type ParsedTx, type Seg } from '../xrpl/parse';
+import { BRIDGES, chainName, doorOf, explorerFor, extId, isExternal, parseExt, shortForeign } from '../bridges/registry';
+import { NETWORKS, chainOf, isLoadable, rawAddress, type Network } from '../chains/chains';
+import type { EvmAccount, EvmEvent } from '../chains/evm';
+import type { CrossChain } from '../bridges/decode';
+import type { CrossRecord } from '../app';
 import { traits, isBlackholed } from '../xrpl/flags';
 import { fmtNum, fmtXrp, fmtDate, fmtDateTime, fmtAge, timeAgo, type Amt } from '../xrpl/amount';
 import { ADVISORY_TEXT, type Identity } from '../identity/directory';
 import type { NodeKind } from '../graph/model';
 
-const EXPLORERS = (a: string) => [
-  { name: 'XRPScan', href: `https://xrpscan.com/account/${a}` },
-  { name: 'XRPL Explorer', href: `https://livenet.xrpl.org/accounts/${a}` },
-  { name: 'Bithomp', href: `https://bithomp.com/explorer/${a}` },
-];
+const EXPLORERS = (id: string) => {
+  const chain = chainOf(id);
+  const a = rawAddress(id);
+  if (chain === 'xahau') return [{ name: 'Xahau Explorer', href: NETWORKS.xahau.explorer.account(a) }];
+  if (chain === 'xrpl-evm') return [{ name: 'XRPL EVM Explorer', href: NETWORKS['xrpl-evm'].explorer.account(a) }];
+  return [
+    { name: 'XRPScan', href: `https://xrpscan.com/account/${a}` },
+    { name: 'XRPL Explorer', href: `https://livenet.xrpl.org/accounts/${a}` },
+    { name: 'Bithomp', href: `https://bithomp.com/explorer/${a}` },
+  ];
+};
 
 const EDGE_WORD: Record<string, string> = {
   payment: 'payments',
@@ -24,6 +34,7 @@ const EDGE_WORD: Record<string, string> = {
   dex: 'trading',
   control: 'control',
   crosschain: 'cross-chain',
+  contract: 'contract calls',
 };
 
 export class Inspector {
@@ -101,6 +112,8 @@ export class Inspector {
       },
       shapeGlyph(kind, 11),
       h('span', null, app.dir.label(addr)),
+      // The same address exists on several networks: say which one this is.
+      chainOf(addr) !== 'xrpl' && isLoadable(addr) ? h('span', { class: 'chip-net' }, NETWORKS[chainOf(addr) as Network].short) : null,
     );
   }
 
@@ -113,18 +126,35 @@ export class Inspector {
   }
 
   private amt(a: Amt): HTMLElement {
-    const title = a.isXrp ? 'XRP, the ledger’s native currency' : a.issuer ? `${a.currency} token issued by ${this.app.dir.label(a.issuer)} (${a.issuer})` : a.currency;
+    const title = a.isXrp ? `${a.currency}, the network’s own currency` : a.issuer ? `${a.currency} token issued by ${this.app.dir.label(a.issuer)} (${a.issuer})` : a.currency;
     return h('span', { class: `amt${a.isXrp ? ' xrp' : ''}`, title }, `${fmtNum(a.value)} ${a.currency}`);
   }
 
-  private segs(segs: Seg[], me: string): (HTMLElement | string)[] {
+  private segs(segs: Seg[], me: string, hash?: string): (HTMLElement | string)[] {
     return segs.map((s) => {
       if (typeof s === 'string') return s;
       if ('a' in s) return this.chip(s.a, { me });
       if ('amt' in s) return this.amt(s.amt);
-      if ('badge' in s) return h('span', { class: 'badge', title: s.tip, tabindex: '0' }, s.badge);
+      if ('badge' in s) return s.badge === 'declared' && hash ? this.evidence(hash, s.tip) : h('span', { class: 'badge', title: s.tip, tabindex: '0' }, s.badge);
       return h('span', { class: 'dtag', title: 'Destination tag: exchanges use this number to know which customer a payment belongs to.' }, `tag ${s.tag}`);
     });
+  }
+
+  /** "declared" until the other network is checked; then confirmed / not found. */
+  private evidence(hash: string, declaredTip: string): HTMLElement {
+    const c = this.app.verifier.get(hash);
+    if (!c || c.status === 'declared') return h('span', { class: 'badge', title: declaredTip, tabindex: '0' }, 'declared');
+    if (c.status === 'checking') return h('span', { class: 'badge checking', title: c.how, tabindex: '0' }, h('span', { class: 'spinner tiny' }), 'checking');
+    if (c.status === 'confirmed') return h('span', { class: 'badge ok', title: c.how, tabindex: '0' }, icon('checkCircle', 11), 'confirmed');
+    if (c.status === 'not-found') return h('span', { class: 'badge warn', title: c.how, tabindex: '0' }, icon('alert', 11), 'not found');
+    return h('span', { class: 'badge', title: `${declaredTip}\n${c.how}`, tabindex: '0' }, 'declared');
+  }
+
+  /** Link to the matching transaction on the other network, once confirmed. */
+  private proofLink(hash: string): (string | HTMLElement)[] {
+    const c = this.app.verifier.get(hash);
+    if (c?.status !== 'confirmed' || !c.other) return [];
+    return [' · ', h('a', { href: c.other.href, target: '_blank', rel: 'noopener', title: c.how }, `on ${NETWORKS[c.other.network].name}`, icon('external', 10))];
   }
 
   private section(title: string, sub: string | null, ...children: (Node | string | null | false | undefined)[]): HTMLElement {
@@ -140,10 +170,12 @@ export class Inspector {
   private render() {
     const id = this.id;
     if (!id) return;
-    if (isExternal(id)) return this.renderExternal(id);
+    if (!isLoadable(id)) return this.renderExternal(id);
+    if (chainOf(id) === 'xrpl-evm') return this.renderEvm(id);
     const app = this.app;
     const ident = app.dir.get(id);
-    const d = app.loader.loaded.get(id);
+    const d = app.accountData(id);
+    const net = NETWORKS[chainOf(id) as Network];
     const node = app.model.nodes.get(id);
     const kind: NodeKind = node?.kind ?? app.classify(id);
     const scroll = this.body?.scrollTop ?? 0;
@@ -153,7 +185,8 @@ export class Inspector {
       'div',
       { class: 'ins-body' },
       this.warnings(ident, node?.state === 'error' && !d),
-      this.bridgeSection(id, d),
+      app.ext.inspectorBanner?.(id) ?? null,
+      this.bridgeSection(id, d?.txs, !!d, !!d?.obligations.length),
       this.who(id, ident, d),
       this.glance(d, node?.state),
       this.traceSection(id, app.traces.get(id)),
@@ -171,8 +204,8 @@ export class Inspector {
         h(
           'p',
           null,
-          'Balances and history come straight from the XRP Ledger',
-          app.client.server ? ` (via ${app.client.server.replace('wss://', '')})` : '',
+          `Balances and history come straight from ${chainOf(id) === 'xrpl' ? 'the XRP Ledger' : net.name}`,
+          chainOf(id) === 'xrpl' && app.client.server ? ` (via ${app.client.server.replace('wss://', '')})` : '',
           '. Names come from public directories and the account’s own website, so each one lists its source. They can be wrong.',
         ),
       ),
@@ -186,11 +219,13 @@ export class Inspector {
     const app = this.app;
     const verified = ident.claims.some((c) => c.verified) || ident.domainCheck === 'confirmed';
     const avatar = ident.avatar ? h('img', { src: ident.avatar, alt: '', class: 'avatar', referrerpolicy: 'no-referrer' }) : identicon(id);
+    const raw = rawAddress(id);
     const copyBtn = h('button', { class: 'icon-btn', title: 'Copy address', 'aria-label': 'Copy address' }, icon('copy', 14));
     copyBtn.onclick = async () => {
-      if (await copyText(id)) app.toast('Address copied');
+      if (await copyText(raw)) app.toast('Address copied');
     };
     const running = app.traces.get(id)?.running;
+    const chain = chainOf(id);
     return h(
       'header',
       { class: 'ins-head' },
@@ -208,11 +243,18 @@ export class Inspector {
             ident.tag ? h('span', { class: 'tag' }, ident.tag) : null,
             verified ? h('span', { class: 'verified', title: 'At least one source verified this identity' }, icon('checkCircle', 15)) : null,
           ),
-          h('div', { class: 'kind', title: KIND_HINT[kind] }, shapeGlyph(kind, 12), KIND_LABEL[kind], state === 'loading' ? h('span', { class: 'spinner', 'aria-label': 'Loading' }) : null),
+          h(
+            'div',
+            { class: 'kind', title: KIND_HINT[kind] },
+            shapeGlyph(kind, 12),
+            KIND_LABEL[kind],
+            chain !== 'xrpl' ? this.netChip(chain) : null,
+            state === 'loading' ? h('span', { class: 'spinner', 'aria-label': 'Loading' }) : null,
+          ),
         ),
         h('button', { class: 'icon-btn close', title: 'Close (Esc)', 'aria-label': 'Close details', onclick: () => app.select(null) }, icon('x', 16)),
       ),
-      h('div', { class: 'addr-row' }, h('code', { class: 'addr', title: 'The account’s public address' }, id), copyBtn),
+      h('div', { class: 'addr-row' }, h('code', { class: 'addr', title: 'The account’s public address' }, raw), copyBtn),
       h(
         'div',
         { class: 'ins-actions' },
@@ -265,7 +307,7 @@ export class Inspector {
         h(
           'li',
           { class: 'claim' },
-          h('span', { class: `claim-ico${c.verified ? ' ok' : ''}` }, icon(c.verified ? 'checkCircle' : c.source === 'Your label' ? 'tag' : 'user', 15)),
+          h('span', { class: `claim-ico${c.verified ? ' ok' : ''}` }, icon(c.verified ? 'checkCircle' : c.source === 'Your label' ? 'tag' : c.source === 'Your wallet' ? 'wallet' : 'user', 15)),
           h(
             'div',
             null,
@@ -313,6 +355,7 @@ export class Inspector {
       rows.push(h('li', { class: 'claim' }, h('span', { class: 'claim-ico' }, icon('lock', 15)), h('div', null, h('div', { class: 'claim-text' }, 'Black hole address'), h('div', { class: 'claim-src' }, 'A special address nobody has a key for. Accounts that hand control to it can never be controlled again.'))));
     }
 
+    const twin = this.twinNote(id);
     const empty = !rows.length;
     const lookups = ident.light === 'loading' || ident.deep === 'loading';
     const note = ident.userNote ? h('p', { class: 'user-note' }, icon('tag', 13), ident.userNote) : null;
@@ -327,6 +370,7 @@ export class Inspector {
             lookups && !d ? 'Looking this account up in public directories…' : 'No public identity. That’s normal: most accounts belong to private individuals. You can still see everything it did below.',
           )
         : h('ul', { class: 'claims' }, ...rows),
+      twin,
       note,
       labelForm ??
         h(
@@ -366,8 +410,14 @@ export class Inspector {
       stats.push(h('div', { class: 'stat', title: title ?? '' }, h('div', { class: 'stat-label' }, label), h('div', { class: 'stat-value' }, value), sub ? h('div', { class: 'stat-sub' }, sub) : null));
 
     if (d.exists) {
-      const reserve = app.client.reserveBase + d.ownerCount * app.client.reserveInc;
-      stat('XRP balance', fmtXrp(d.balance), `${fmtNum(reserve)} XRP locked as reserve`, 'Every account must keep a small amount of XRP locked (the reserve) to exist on the ledger.');
+      const client = d.chain === 'xahau' ? (app.xahauConnected ?? app.client) : app.client;
+      const reserve = client.reserveBase + d.ownerCount * client.reserveInc;
+      stat(
+        `${d.native} balance`,
+        d.native === 'XRP' ? fmtXrp(d.balance) : `${fmtNum(d.balance)} ${d.native}`,
+        `${fmtNum(reserve)} ${d.native} locked as reserve`,
+        `Every account must keep a small amount of ${d.native} locked (the reserve) to exist on the ledger.`,
+      );
     } else {
       stat('Status', 'No account', 'Deleted or never activated');
     }
@@ -375,7 +425,17 @@ export class Inspector {
     if (a?.date) stat('Created', fmtDate(a.date), `${fmtAge(a.date)} ago`);
     else if (a?.unknown === 'genesis') stat('Created', 'Before 2013', 'Older than the surviving ledger records');
     else stat('Created', 'Unknown', null);
-    if (a?.parent) {
+    if (a?.parent && a.via === 'Import') {
+      stats.push(
+        h(
+          'div',
+          { class: 'stat wide' },
+          h('div', { class: 'stat-label' }, 'Brought to life by'),
+          h('div', { class: 'stat-value' }, 'Importing from the XRP Ledger: ', this.chip(a.parent)),
+          h('div', { class: 'stat-sub' }, 'Burn 2 Mint: the Import carries proof of a burn on the XRP Ledger', a.amount ? [', crediting ', this.amt(a.amount)] : ''),
+        ),
+      );
+    } else if (a?.parent) {
       stats.push(
         h(
           'div',
@@ -529,15 +589,19 @@ export class Inspector {
   }
 
   private dealsWith(d: AccountData) {
+    return this.dealsWithItems(d.address, summarize(d), d.native);
+  }
+
+  private dealsWithItems(me: string, s: ReturnType<typeof summarize>, native: string) {
     const app = this.app;
-    const s = summarize(d);
+    const d = { address: me };
     if (!s.counterparties.length) return null;
     const max = Math.max(...s.counterparties.map((c) => c.count));
     const rows = s.counterparties.slice(0, this.cpShown).map((c) => {
       const inGraph = app.model.nodes.has(c.address) && app.model.neighbors(c.address).includes(d.address);
       const parts: (string | HTMLElement)[] = [`${c.count} tx`, [...c.kinds].map((k) => EDGE_WORD[k]).join(', ')];
-      if (c.xrpIn) parts.push(h('span', { class: 'flow-in', title: 'XRP received from them' }, `↓ ${fmtNum(c.xrpIn)} XRP`));
-      if (c.xrpOut) parts.push(h('span', { class: 'flow-out', title: 'XRP sent to them' }, `↑ ${fmtNum(c.xrpOut)} XRP`));
+      if (c.xrpIn) parts.push(h('span', { class: 'flow-in', title: `${native} received from them` }, `↓ ${fmtNum(c.xrpIn)} ${native}`));
+      if (c.xrpOut) parts.push(h('span', { class: 'flow-out', title: `${native} sent to them` }, `↑ ${fmtNum(c.xrpOut)} ${native}`));
       return h(
         'li',
         { class: 'cp' },
@@ -551,8 +615,8 @@ export class Inspector {
     const more = s.counterparties.length - this.cpShown;
     return this.section(
       'Who it deals with',
-      `${s.counterparties.length} accounts`,
-      h('p', { class: 'muted small' }, `From the latest ${s.txCount} transactions${s.from ? `, ${fmtDate(s.from)} to ${fmtDate(s.to)}` : ''}.`, s.xrpIn || s.xrpOut ? [' XRP in: ', h('strong', null, fmtNum(s.xrpIn)), ' · out: ', h('strong', null, fmtNum(s.xrpOut))] : null),
+      `${s.counterparties.length} ${s.counterparties.length === 1 ? 'account' : 'accounts'}`,
+      h('p', { class: 'muted small' }, `From the latest ${s.txCount === 1 ? 'transaction' : `${s.txCount} transactions`}${s.from ? `, ${fmtDate(s.from)} to ${fmtDate(s.to)}` : ''}.`, s.xrpIn || s.xrpOut ? [` ${native} in: `, h('strong', null, fmtNum(s.xrpIn)), ' · out: ', h('strong', null, fmtNum(s.xrpOut))] : null),
       h('ul', { class: 'cps' }, ...rows),
       more > 0 ? h('button', { class: 'link small', onclick: () => ((this.cpShown += 20), this.render()) }, `Show ${Math.min(more, 20)} more`) : null,
       more > 0 || s.counterparties.length > app.settings.neighborLimit
@@ -607,7 +671,7 @@ export class Inspector {
       h(
         'div',
         { class: 'act-main' },
-        h('div', { class: 'act-text' }, ...this.segs(ds.segs, me)),
+        h('div', { class: 'act-text' }, ...this.segs(ds.segs, me, t.hash)),
         h(
           'div',
           { class: 'act-meta' },
@@ -615,19 +679,21 @@ export class Inspector {
           ' · ',
           t.type,
           ' · ',
-          h('a', { href: `https://livenet.xrpl.org/transactions/${t.hash}`, target: '_blank', rel: 'noopener', title: 'Open the raw transaction in a block explorer' }, 'details', icon('external', 10)),
+          h('a', { href: NETWORKS[t.net].explorer.tx(t.hash), target: '_blank', rel: 'noopener', title: 'Open the raw transaction in a block explorer' }, 'details', icon('external', 10)),
+          ...this.proofLink(t.hash),
         ),
       ),
     );
   }
 
   /** For bridge door accounts: what the bridge is and what crossed through it. */
-  private bridgeSection(id: string, d?: AccountData) {
+  private bridgeSection(id: string, items: { cross: CrossChain | null }[] | undefined, loaded: boolean, issues: boolean) {
     const b = doorOf(id);
     if (!b) return null;
     const groups = new Map<string, { dir: 'out' | 'in'; chain: string; node?: string; count: number; xrp: number; tokens: number }>();
     let housekeeping = 0;
-    for (const t of d?.txs ?? []) {
+    const here = NETWORKS[chainOf(id) as Network]?.name ?? 'this network';
+    for (const t of items ?? []) {
       const c = t.cross;
       if (!c || c.bridge !== b.id) continue;
       if (c.direction === 'internal') {
@@ -647,7 +713,7 @@ export class Inspector {
         h(
           'li',
           { class: 'xc-row' },
-          h('span', { class: 'xc-dir', title: g.dir === 'out' ? 'Leaving the XRP Ledger' : 'Arriving on the XRP Ledger' }, icon(g.dir === 'out' ? 'out' : 'in', 14)),
+          h('span', { class: 'xc-dir', title: g.dir === 'out' ? `Leaving ${here}` : `Arriving on ${here}` }, icon(g.dir === 'out' ? 'out' : 'in', 14)),
           h('span', { class: 'xc-chain' }, g.dir === 'out' ? 'to ' : 'from ', g.node ? this.chip(g.node) : h('strong', null, chainName(g.chain))),
           h('span', { class: 'xc-stat' }, `${g.count} transfer${g.count > 1 ? 's' : ''}`, g.xrp ? ` · ${fmtNum(g.xrp)} XRP` : '', g.tokens ? ` · ${g.tokens} in tokens` : ''),
         ),
@@ -658,24 +724,24 @@ export class Inspector {
       h('p', { class: 'bridge-blurb' }, b.blurb),
       b.caution ? h('div', { class: 'banner warn' }, icon('alert', 16), h('div', null, h('p', { class: 'flush' }, b.caution))) : null,
       rows.length ? h('ul', { class: 'xc-list' }, ...rows) : null,
-      d
+      loaded
         ? h(
             'p',
             { class: 'muted small' },
             rows.length
-              ? 'From readable memos in the loaded history. Each one is declared by the sender; arrival on the other chain isn’t verified here.'
+              ? 'From the loaded history. Transfers to connected networks are checked on the other side (see each one’s badge below).'
               : 'No readable cross-chain transfers in the loaded history. Bridge accounts often also trade or issue tokens, which can crowd out deposits.',
             housekeeping ? ` Plus ${housekeeping} internal move${housekeeping > 1 ? 's' : ''} between the bridge’s own accounts.` : '',
           )
         : null,
-      d?.obligations.length ? h('p', { class: 'muted small' }, 'The tokens this account issues stand for assets held on other chains.') : null,
+      issues ? h('p', { class: 'muted small' }, 'The tokens this account issues stand for assets held on other chains.') : null,
       h('a', { class: 'link small', href: b.url, target: '_blank', rel: 'noopener' }, new URL(b.url).hostname, icon('external', 11)),
     );
   }
 
   /** For regular accounts: transfers that left or entered the XRP Ledger. */
   private crossActivity(id: string, d: AccountData) {
-    const list = d.txs.filter((t) => t.cross && t.cross.direction !== 'internal' && t.cross.xrpl === id);
+    const list = d.txs.filter((t) => t.cross && t.cross.direction !== 'internal' && t.cross.local === id);
     if (!list.length) return null;
     return this.section(
       'Cross-chain activity',
@@ -691,8 +757,8 @@ export class Inspector {
     const { chain, address } = parseExt(id);
     const node = app.model.nodes.get(id);
     const records = [...(app.crossLog.get(id)?.values() ?? [])].sort((a, b) => b.date - a.date);
-    const accounts = new Set(records.map((r) => r.cross!.xrpl));
-    const bridges = new Set(records.map((r) => r.cross!.bridge));
+    const accounts = new Set(records.map((r) => r.cross.local));
+    const bridges = new Set(records.map((r) => r.cross.bridge));
     let xrpTo = 0;
     let xrpFrom = 0;
     for (const r of records) {
@@ -756,7 +822,7 @@ export class Inspector {
         records.length
           ? h('p', { class: 'muted small' }, `${accounts.size} XRP Ledger account${accounts.size === 1 ? '' : 's'}, via ${[...bridges].map((b) => BRIDGES[b].name).join(', ')}. `, ...totals)
           : h('p', { class: 'muted' }, 'No transfers recorded yet.'),
-        h('ul', { class: 'acts' }, ...records.slice(0, 40).map((t) => this.txRow(t, id))),
+        h('ul', { class: 'acts' }, ...records.slice(0, 40).map((r) => this.crossRow(r, id))),
       ),
       this.section(
         'How sure is this?',
@@ -788,6 +854,206 @@ export class Inspector {
     this.body = body;
     body.scrollTop = scroll;
   }
+
+  /* ---------------------------- networks ---------------------------- */
+
+  private netChip(chain: string): HTMLElement {
+    const n = NETWORKS[chain as Network];
+    return h('span', { class: 'net-chip', title: n?.blurb ?? '' }, n?.short ?? chainName(chain));
+  }
+
+  /** Xahau and the XRP Ledger share addresses: the same address means the same keys. */
+  private twinNote(id: string): HTMLElement | null {
+    const chain = chainOf(id);
+    if (chain === 'xahau') {
+      const raw = rawAddress(id);
+      return h(
+        'div',
+        { class: 'twin' },
+        icon('key', 13),
+        h('div', null, 'Same address on the XRP Ledger: ', this.chip(raw), h('p', { class: 'muted small flush' }, 'Same address means the same master key, so it almost certainly has the same owner. Names above come from the XRP Ledger side.')),
+      );
+    }
+    if (chain === 'xrpl') {
+      const twin = extId('xahau', id);
+      return h(
+        'button',
+        { class: 'link small', onclick: () => void this.app.explore(twin), title: 'Xahau uses the same addresses and keys. Look this address up there.' },
+        icon('key', 12),
+        this.app.model.nodes.has(twin) ? 'Show the same address on Xahau' : 'Look up the same address on Xahau',
+      );
+    }
+    return null;
+  }
+
+  /** A cross-chain record from any network (used on pages for addresses on unconnected chains). */
+  private crossRow(rec: CrossRecord, me: string): HTMLElement {
+    if (rec.network !== 'xrpl-evm' && 'net' in rec.item) return this.txRow(rec.item as ParsedTx, me);
+    return this.evmRow(rec.item as EvmEvent, me);
+  }
+
+  /* ------------------------- XRPL EVM Sidechain ------------------------ */
+
+  private describeEvm(e: EvmEvent, me: string): Description {
+    if (e.cross && e.success) return describeCrossing(e.cross, me);
+    const amt: Seg = e.amount ? { amt: e.amount } : 'tokens';
+    let d: Description;
+    switch (e.kind) {
+      case 'native':
+      case 'token':
+        d = e.from === me ? { icon: 'out', dir: 'out', segs: ['Sent ', amt, ' to ', { a: e.to }] } : e.to === me ? { icon: 'in', dir: 'in', segs: ['Received ', amt, ' from ', { a: e.from }] } : { icon: 'route', dir: 'neutral', segs: [{ a: e.from }, ' sent ', amt, ' to ', { a: e.to }] };
+        break;
+      case 'bridge-in':
+        d = { icon: 'route', dir: 'in', segs: ['Received ', amt, ' delivered by Axelar from another chain'] };
+        break;
+      case 'mint':
+        d = { icon: 'sparkle', dir: 'in', segs: ['Received ', amt, ' (newly created)'] };
+        break;
+      case 'burn':
+        d = { icon: 'flame', dir: 'out', segs: ['Burned ', amt] };
+        break;
+      default:
+        d = e.from === me
+          ? { icon: 'activity', dir: 'neutral', segs: ['Called ', { a: e.to }, e.method ? ` (${e.method})` : ''] }
+          : { icon: 'activity', dir: 'neutral', segs: [{ a: e.from }, ' called this contract', e.method ? ` (${e.method})` : ''] };
+    }
+    if (!e.success) d = { icon: 'x', dir: 'neutral', segs: ['Failed: ', ...d.segs] };
+    return d;
+  }
+
+  private evmRow(e: EvmEvent, me: string): HTMLElement {
+    const ds = this.describeEvm(e, me);
+    return h(
+      'li',
+      { class: `act ${ds.dir}${e.success ? '' : ' failed'}` },
+      h('span', { class: 'act-ico', title: e.method ?? e.kind }, icon(ds.icon, 14)),
+      h(
+        'div',
+        { class: 'act-main' },
+        h('div', { class: 'act-text' }, ...this.segs(ds.segs, me, e.hash)),
+        h(
+          'div',
+          { class: 'act-meta' },
+          h('time', { datetime: new Date(e.date).toISOString(), title: fmtDateTime(e.date) }, timeAgo(e.date)),
+          e.method ? [' · ', e.method] : '',
+          ' · ',
+          h('a', { href: NETWORKS['xrpl-evm'].explorer.tx(e.hash), target: '_blank', rel: 'noopener', title: 'Open the transaction on the XRPL EVM explorer' }, 'details', icon('external', 10)),
+          ...this.proofLink(e.hash),
+        ),
+      ),
+    );
+  }
+
+  private renderEvm(id: string) {
+    const app = this.app;
+    const ident = app.dir.get(id);
+    const acc: EvmAccount | undefined = app.evm.loaded.get(id);
+    const info = acc ?? app.evm.probed.get(id);
+    const node = app.model.nodes.get(id);
+    const kind: NodeKind = node?.kind ?? app.classify(id);
+    const scroll = this.body?.scrollTop ?? 0;
+    const raw = rawAddress(id);
+    clear(this.el);
+
+    const copyBtn = h('button', { class: 'icon-btn', title: 'Copy address', 'aria-label': 'Copy address' }, icon('copy', 14));
+    copyBtn.onclick = async () => {
+      if (await copyText(raw)) app.toast('Address copied');
+    };
+    const expanded = !!node?.expanded;
+    const head = h(
+      'header',
+      { class: 'ins-head' },
+      h(
+        'div',
+        { class: 'ins-top' },
+        identicon(id),
+        h(
+          'div',
+          { class: 'ins-title' },
+          h('h2', null, ident.name ? h('span', null, ident.name) : h('span', { class: 'unnamed mono' }, shortForeign(raw))),
+          h('div', { class: 'kind', title: KIND_HINT[kind] }, shapeGlyph(kind, 12), KIND_LABEL[kind], this.netChip('xrpl-evm'), node?.state === 'loading' ? h('span', { class: 'spinner', 'aria-label': 'Loading' }) : null),
+        ),
+        h('button', { class: 'icon-btn close', title: 'Close (Esc)', 'aria-label': 'Close details', onclick: () => app.select(null) }, icon('x', 16)),
+      ),
+      h('div', { class: 'addr-row' }, h('code', { class: 'addr', title: 'Address on the XRPL EVM Sidechain' }, raw), copyBtn),
+      h(
+        'div',
+        { class: 'ins-actions' },
+        h('button', { class: 'btn primary', onclick: () => (expanded ? app.collapse(id) : void app.expand(id)) }, icon('network', 15), expanded ? 'Collapse' : 'Show connections'),
+        h('a', { class: 'btn', href: NETWORKS['xrpl-evm'].explorer.account(raw), target: '_blank', rel: 'noopener' }, icon('external', 15), 'Explorer'),
+        h('button', { class: `icon-btn${node?.pinned ? ' on' : ''}`, onclick: () => (app.view.togglePin(id), this.render()), title: node?.pinned ? 'Unpin' : 'Pin in place', 'aria-label': 'Pin' }, icon('pin', 15)),
+        h('button', { class: 'icon-btn', onclick: () => app.view.focusNode(id), title: 'Center on map', 'aria-label': 'Center' }, icon('crosshair', 15)),
+      ),
+    );
+
+    // At a glance
+    const stats: HTMLElement[] = [];
+    const stat = (label: string, value: Node | string, sub?: Node | string | null) =>
+      stats.push(h('div', { class: 'stat' }, h('div', { class: 'stat-label' }, label), h('div', { class: 'stat-value' }, value), sub ? h('div', { class: 'stat-sub' }, sub) : null));
+    if (info) {
+      if (!info.exists) stat('Status', 'Never used', 'This address has no activity on the XRPL EVM Sidechain');
+      else {
+        stat('XRP balance', fmtXrp(info.balance), 'XRP pays the fees on this chain');
+        stat('Type', info.token ? `${info.token.type} token` : info.isContract ? 'Smart contract' : 'Regular address', info.isContract ? (info.verified ? 'Source code published' : 'Source code not published') : 'Controlled by a private key');
+        if (info.token) stat('Token', `${info.token.symbol}`, [info.token.holders != null ? `${fmtNum(info.token.holders)} holders` : '', info.token.supply != null ? ` · supply ${fmtNum(info.token.supply)}` : ''].join(''));
+      }
+    }
+    const glance = this.section('At a glance', null, info ? h('div', { class: 'stats' }, ...stats) : node?.state === 'error' ? h('p', { class: 'muted' }, 'Not available.') : this.skeleton(3));
+
+    // Who is this?
+    const claims = ident.claims.map((c) =>
+      h('li', { class: 'claim' }, h('span', { class: 'claim-ico' }, icon(c.source === 'Your label' ? 'tag' : 'user', 15)), h('div', null, h('div', { class: 'claim-text' }, c.text), h('div', { class: 'claim-src' }, c.source))),
+    );
+    const who = this.section(
+      'Who is this?',
+      null,
+      claims.length ? h('ul', { class: 'claims' }, ...claims) : h('p', { class: 'muted' }, 'No public name. Most addresses on this chain are anonymous, and contracts only get names when their authors publish the source code.'),
+      ident.userNote ? h('p', { class: 'user-note' }, icon('tag', 13), ident.userNote) : null,
+      this.editingLabel ? this.labelForm(id, ident) : h('button', { class: 'link small', onclick: () => ((this.editingLabel = true), this.render()) }, icon('tag', 13), ident.userLabel ? 'Edit your private label' : 'Add your own private label'),
+    );
+
+    const events = acc?.events ?? [];
+    const crosses = events.filter((e) => e.cross && e.cross.direction !== 'internal' && (e.cross.local === id || doorOf(id)));
+    const holdings = acc?.holdings ?? [];
+    const body = h(
+      'div',
+      { class: 'ins-body' },
+      node?.state === 'error' && !acc
+        ? h('div', { class: 'banners' }, h('div', { class: 'banner warn' }, icon('alert', 16), h('div', null, h('strong', null, 'Couldn’t load this address'), h('p', null, 'The XRPL EVM explorer didn’t answer. ', h('button', { class: 'link', onclick: () => void app.loadEvm(id).catch(() => {}) }, 'Try again')))))
+        : null,
+      this.bridgeSection(id, events, !!acc, false),
+      who,
+      glance,
+      crosses.length ? this.section('Cross-chain activity', `${crosses.length} transfer${crosses.length > 1 ? 's' : ''}`, h('ul', { class: 'acts' }, ...crosses.slice(0, 8).map((e) => this.evmRow(e, id)))) : null,
+      holdings.length
+        ? this.section(
+            'Tokens it holds',
+            null,
+            h('ul', { class: 'tok-list' }, ...holdings.slice(0, 15).map((x) => h('li', null, h('span', { class: 'tok-cur' }, x.token.symbol), h('span', { class: 'tok-val' }, fmtNum(x.value)), h('span', { class: 'tok-iss' }, this.chip(`ext:xrpl-evm:${x.token.address}`))))),
+          )
+        : null,
+      acc ? this.dealsWithItems(id, summarizeFlows(id, events as { date: number; flows: Flow[] }[]), 'XRP') : null,
+      acc
+        ? this.section(
+            'Recent activity',
+            `${events.length} loaded`,
+            events.length ? h('ul', { class: 'acts' }, ...events.slice(0, this.activityShown).map((e) => this.evmRow(e, id))) : h('p', { class: 'muted' }, 'No activity found.'),
+            h(
+              'div',
+              { class: 'row' },
+              events.length > this.activityShown ? h('button', { class: 'btn small', onclick: () => ((this.activityShown += 40), this.render()) }, 'Show more') : null,
+              events.length <= this.activityShown && !acc.done
+                ? h('button', { class: 'btn small', onclick: async (ev: Event) => ((ev.currentTarget as HTMLButtonElement).disabled = true, (this.activityShown += 40), await app.loadMoreHistory(id)) }, icon('history', 13), 'Load older history')
+                : null,
+            ),
+          )
+        : this.section('Recent activity', null, this.skeleton(5)),
+      h('footer', { class: 'ins-foot' }, icon('info', 13), h('p', null, 'Data comes from the XRPL EVM Sidechain’s public explorer (Blockscout). Names come from the explorer and can be wrong; most contracts are unnamed.')),
+    );
+    this.el.append(head, body);
+    this.body = body;
+    body.scrollTop = scroll;
+  }
 }
 
 function isBlackholeAddr(a: string) {
@@ -795,7 +1061,7 @@ function isBlackholeAddr(a: string) {
 }
 
 /** Deterministic, monochrome 5×5 avatar so each address is recognizable at a glance. */
-export function identicon(addr: string): HTMLElement {
+export function identicon(addr: string, size = 40): HTMLElement {
   let hsh = 2166136261;
   for (let i = 0; i < addr.length; i++) hsh = Math.imul(hsh ^ addr.charCodeAt(i), 16777619) >>> 0;
   const cells: string[] = [];
@@ -811,6 +1077,6 @@ export function identicon(addr: string): HTMLElement {
   }
   const el = document.createElement('div');
   el.className = 'avatar identicon';
-  el.innerHTML = `<svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true" fill="currentColor">${cells.join('')}</svg>`;
+  el.innerHTML = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true" fill="currentColor">${cells.join('')}</svg>`;
   return el;
 }

@@ -6,15 +6,19 @@
   "description": "An Obsidian-style interactive graph explorer for the XRP Ledger",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "npm run typecheck && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json"
   },
   "dependencies": {
-    "d3-force": "^3.0.0"
+    "@scure/bip39": "^2.4.0",
+    "@xrplf/secret-numbers": "^3.0.0",
+    "d3-force": "^3.0.0",
+    "xrpl": "^5.3.0"
   },
   "devDependencies": {
     "@types/d3-force": "^3.0.10",
+    "@types/node": "^24.19.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.2"
   }

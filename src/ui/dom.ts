@@ -1,5 +1,5 @@
 /** A tiny hyperscript helper so UI code stays readable without a framework. */
-type Child = Node | string | number | null | undefined | false | Child[];
+export type Child = Node | string | number | null | undefined | false | Child[];
 type Props = Record<string, unknown> | null | undefined;
 
 export function h<K extends keyof HTMLElementTagNameMap>(tag: K, props?: Props, ...children: Child[]): HTMLElementTagNameMap[K] {

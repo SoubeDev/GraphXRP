@@ -3,11 +3,12 @@
  *  - flows: directed relationships between accounts (graph edges), and
  *  - plain-English sentences told from a given account's point of view.
  */
-import { parseAmount, rippleTimeToMs, decodeCurrency, fmtNum, type Amt } from './amount';
+import { parseAmount as parseAmountRaw, rippleTimeToMs, decodeCurrency, fmtNum, type Amt } from './amount';
 import { decodeCrossChain, type CrossChain } from '../bridges/decode';
+import { XRPL_CTX, type ChainCtx } from '../chains/chains';
 import { BRIDGES, chainName, doorOf } from '../bridges/registry';
 
-export type EdgeType = 'payment' | 'activation' | 'trust' | 'dex' | 'control' | 'crosschain';
+export type EdgeType = 'payment' | 'activation' | 'trust' | 'dex' | 'control' | 'crosschain' | 'contract';
 
 export interface Flow {
   from: string;
@@ -32,6 +33,10 @@ export interface ParsedTx {
   amm?: string;
   /** Cross-chain intent read from the transaction (bridge memos, Burn 2 Mint). */
   cross: CrossChain | null;
+  /** Network this transaction lives on, its native currency, and its address → graph-id mapping. */
+  net: ChainCtx['chain'];
+  native: string;
+  id: (address: string) => string;
   tx: any;
   meta: any;
 }
@@ -54,7 +59,8 @@ function metaNodes(meta: any): MetaNode[] {
   return out;
 }
 
-export function parseTx(entry: any): ParsedTx {
+export function parseTx(entry: any, ctx: ChainCtx = XRPL_CTX): ParsedTx {
+  const parseAmount = (a: unknown) => parseAmountRaw(a, ctx.native);
   const tx = entry.tx ?? entry.tx_json ?? entry;
   const meta = entry.meta ?? entry.metaData ?? {};
   const hash: string = tx.hash ?? entry.hash ?? '';
@@ -162,6 +168,9 @@ export function parseTx(entry: any): ParsedTx {
         if (a && tx.Amount?.issuer) add(tx.Amount.issuer, account, 'payment', { ...a, issuer: account });
         break;
       }
+      case 'Remit': // Xahau: send several amounts (and URI tokens) at once
+        for (const e of tx.Amounts ?? []) add(account, destination, created.includes(destination ?? '') ? 'activation' : 'payment', parseAmount(e.AmountEntry?.Amount));
+        break;
       case 'SetRegularKey':
         if (tx.RegularKey) add(tx.RegularKey, account, 'control');
         break;
@@ -172,9 +181,13 @@ export function parseTx(entry: any): ParsedTx {
   }
 
   // Cross-chain: link the XRP Ledger account to the address (or chain) on the other side.
-  const cross = decodeCrossChain(tx, delivered, success);
-  if (cross?.node && cross.direction === 'out') flows.push({ from: cross.xrpl, to: cross.node, type: 'crosschain', amount: cross.amount });
-  if (cross?.node && cross.direction === 'in') flows.push({ from: cross.node, to: cross.xrpl, type: 'crosschain', amount: cross.amount });
+  // Everything above uses raw addresses; map them to graph ids for this network.
+  const id = ctx.id;
+  const mapAmt = (a: Amt | null | undefined): Amt | null | undefined => (a && a.issuer ? { ...a, issuer: id(a.issuer) } : a);
+  if (ctx.chain !== 'xrpl') for (const f of flows) Object.assign(f, { from: id(f.from), to: id(f.to), amount: mapAmt(f.amount) });
+  const cross = decodeCrossChain(tx, delivered, success, ctx, meta);
+  if (cross?.node && cross.direction === 'out') flows.push({ from: cross.local, to: cross.node, type: 'crosschain', amount: cross.amount });
+  if (cross?.node && cross.direction === 'in') flows.push({ from: cross.node, to: cross.local, type: 'crosschain', amount: cross.amount });
 
   return {
     hash,
@@ -183,14 +196,17 @@ export function parseTx(entry: any): ParsedTx {
     ledger: tx.ledger_index ?? entry.ledger_index ?? 0,
     success,
     result,
-    account,
-    destination,
+    account: id(account),
+    destination: destination ? id(destination) : undefined,
     dtag: tx.DestinationTag,
-    delivered,
+    delivered: mapAmt(delivered) ?? null,
     flows,
-    created,
-    amm,
+    created: created.map(id),
+    amm: amm ? id(amm) : undefined,
     cross,
+    net: ctx.chain,
+    native: ctx.native,
+    id,
     tx,
     meta,
   };
@@ -214,12 +230,12 @@ export function describe(p: ParsedTx, me: string): Description {
   const tx = p.tx;
   const mine = p.account === me;
   const amt = (a: unknown): Seg => {
-    const x = parseAmount(a);
+    const x = parseAmountRaw(a, p.native, p.id);
     return x ? { amt: x } : 'an amount';
   };
   let d: Description;
 
-  const cross = p.success ? describeCross(p, me) : null;
+  const cross = p.success && p.cross ? describeCrossing(p.cross, me) : null;
   if (cross) return cross;
 
   switch (p.type) {
@@ -275,9 +291,9 @@ export function describe(p: ParsedTx, me: string): Description {
       if (!mine) {
         d = { icon: 'link', dir: 'neutral', segs: [{ a: p.account }, ` opted in to hold this account’s ${cur}`] };
       } else if (Number(lim?.value) === 0) {
-        d = { icon: 'link', dir: 'neutral', segs: [`Stopped trusting ${cur} from `, { a: lim.issuer }] };
+        d = { icon: 'link', dir: 'neutral', segs: [`Stopped trusting ${cur} from `, { a: p.id(lim.issuer) }] };
       } else {
-        d = { icon: 'link', dir: 'neutral', segs: [`Opted in to hold up to ${fmtNum(Number(lim.value))} ${cur} issued by `, { a: lim.issuer }] };
+        d = { icon: 'link', dir: 'neutral', segs: [`Opted in to hold up to ${fmtNum(Number(lim.value))} ${cur} issued by `, { a: p.id(lim.issuer) }] };
       }
       break;
     }
@@ -291,7 +307,7 @@ export function describe(p: ParsedTx, me: string): Description {
     }
     case 'SetRegularKey':
       d = tx.RegularKey
-        ? { icon: 'key', dir: 'neutral', segs: ['Gave signing power to ', { a: tx.RegularKey }] }
+        ? { icon: 'key', dir: 'neutral', segs: ['Gave signing power to ', { a: p.id(tx.RegularKey) }] }
         : { icon: 'key', dir: 'neutral', segs: ['Removed its extra signing key'] };
       break;
     case 'SignerListSet':
@@ -305,7 +321,7 @@ export function describe(p: ParsedTx, me: string): Description {
         tx.Destination === p.account
           ? { icon: 'lock', dir: 'neutral', segs: ['Locked ', amt(tx.Amount), ` in escrow for itself${until}`] }
           : mine
-            ? { icon: 'lock', dir: 'out', segs: ['Locked ', amt(tx.Amount), ' in escrow for ', { a: tx.Destination }, until] }
+            ? { icon: 'lock', dir: 'out', segs: ['Locked ', amt(tx.Amount), ' in escrow for ', { a: p.id(tx.Destination) }, until] }
             : { icon: 'lock', dir: 'in', segs: [{ a: p.account }, ' locked ', amt(tx.Amount), ` in escrow for this account${until}`] };
       break;
     }
@@ -321,7 +337,7 @@ export function describe(p: ParsedTx, me: string): Description {
       break;
     case 'CheckCreate':
       d = mine
-        ? { icon: 'check', dir: 'out', segs: ['Wrote a check for up to ', amt(tx.SendMax), ' to ', { a: tx.Destination }] }
+        ? { icon: 'check', dir: 'out', segs: ['Wrote a check for up to ', amt(tx.SendMax), ' to ', { a: p.id(tx.Destination) }] }
         : { icon: 'check', dir: 'in', segs: [{ a: p.account }, ' wrote a check for up to ', amt(tx.SendMax)] };
       break;
     case 'CheckCash': {
@@ -333,7 +349,7 @@ export function describe(p: ParsedTx, me: string): Description {
       d = { icon: 'check', dir: 'neutral', segs: ['Cancelled a check'] };
       break;
     case 'PaymentChannelCreate':
-      d = { icon: 'route', dir: mine ? 'out' : 'in', segs: [{ a: p.account }, ' opened a payment channel to ', { a: tx.Destination }, ' with ', amt(tx.Amount)] };
+      d = { icon: 'route', dir: mine ? 'out' : 'in', segs: [{ a: p.account }, ' opened a payment channel to ', { a: p.id(tx.Destination) }, ' with ', amt(tx.Amount)] };
       break;
     case 'PaymentChannelFund':
     case 'PaymentChannelClaim':
@@ -387,7 +403,7 @@ export function describe(p: ParsedTx, me: string): Description {
       break;
     case 'DepositPreauth':
       d = tx.Authorize
-        ? { icon: 'shield', dir: 'neutral', segs: ['Pre-approved ', { a: tx.Authorize }, ' to send payments'] }
+        ? { icon: 'shield', dir: 'neutral', segs: ['Pre-approved ', { a: p.id(tx.Authorize) }, ' to send payments'] }
         : { icon: 'shield', dir: 'neutral', segs: ['Removed a pre-approval'] };
       break;
     case 'Clawback': {
@@ -395,6 +411,39 @@ export function describe(p: ParsedTx, me: string): Description {
       d = { icon: 'alert', dir: 'neutral', segs: f ? [{ a: f.to }, ' clawed back ', f.amount ? { amt: f.amount } : 'tokens', ' from ', { a: f.from }] : ['Clawed back tokens'] };
       break;
     }
+    // Xahau-only transaction types
+    case 'Remit':
+      d = mine
+        ? { icon: 'out', dir: 'out', segs: ['Sent ', ...remitted(p, amt), ' to ', { a: p.destination! }] }
+        : { icon: 'in', dir: 'in', segs: ['Received ', ...remitted(p, amt), ' from ', { a: p.account }] };
+      break;
+    case 'URITokenMint':
+      d = { icon: 'image', dir: 'neutral', segs: [mine ? 'Minted a URI token (Xahau\u2019s NFT)' : 'A URI token was minted'] };
+      break;
+    case 'URITokenBuy':
+      d = { icon: 'image', dir: mine ? 'out' : 'in', segs: mine ? ['Bought a URI token for ', amt(tx.Amount)] : [{ a: p.account }, ' bought a URI token from this account for ', amt(tx.Amount)] };
+      break;
+    case 'URITokenCreateSellOffer':
+      d = { icon: 'image', dir: 'neutral', segs: ['Offered a URI token for ', amt(tx.Amount)] };
+      break;
+    case 'URITokenCancelSellOffer':
+      d = { icon: 'image', dir: 'neutral', segs: ['Cancelled a URI token sale'] };
+      break;
+    case 'URITokenBurn':
+      d = { icon: 'flame', dir: 'neutral', segs: ['Burned a URI token'] };
+      break;
+    case 'ClaimReward':
+      d = { icon: 'coins', dir: 'in', segs: [tx.Flags & 1 ? 'Opted out of balance rewards' : 'Claimed (or signed up for) XAH balance rewards'] };
+      break;
+    case 'SetHook':
+      d = { icon: 'settings', dir: 'neutral', segs: ['Installed or changed hooks (small programs that run on this account)'] };
+      break;
+    case 'Invoke':
+      d = { icon: 'activity', dir: 'neutral', segs: mine ? ['Called a hook'] : [{ a: p.account }, ' called a hook on this account'] };
+      break;
+    case 'GenesisMint':
+      d = { icon: 'coins', dir: 'in', segs: ['New XAH created by the network (governance mint)'] };
+      break;
     case 'TicketCreate':
       d = { icon: 'settings', dir: 'neutral', segs: ['Reserved transaction slots (tickets)'] };
       break;
@@ -444,10 +493,8 @@ export const DECLARED: Seg = {
   tip: 'Declared: the destination is written in this XRP Ledger transaction. GraphXRP can\u2019t see the other chain yet, so it can\u2019t confirm the funds arrived.',
 };
 
-/** Sentences for cross-chain transactions, told from `me`'s point of view. */
-function describeCross(p: ParsedTx, me: string): Description | null {
-  const c = p.cross;
-  if (!c) return null;
+/** Sentences for cross-chain transactions (any network), told from `me`'s point of view. */
+export function describeCrossing(c: CrossChain, me: string): Description {
   const bridge = BRIDGES[c.bridge].name;
   const value: Seg = c.amount ? { amt: c.amount } : 'funds';
   const extra: Seg[] = c.detail ? [` (${c.detail})`] : [];
@@ -457,14 +504,21 @@ function describeCross(p: ParsedTx, me: string): Description | null {
   }
   const other: Seg = c.node ? { a: c.node } : chainName(c.chain);
   if (c.bridge === 'b2m') {
-    return c.xrpl === me
+    return c.local === me
       ? { icon: 'flame', dir: 'out', segs: ['Burned ', value, ' to mint XAH for itself on ', other, ' (Burn 2 Mint) ', DECLARED] }
-      : { icon: 'flame', dir: 'neutral', segs: [{ a: c.xrpl }, ' burned ', value, ' to mint XAH on ', other, ' ', DECLARED] };
+      : { icon: 'flame', dir: 'neutral', segs: [{ a: c.local }, ' burned ', value, ' to mint XAH on ', other, ' ', DECLARED] };
   }
   if (c.direction === 'out') {
-    const segs: Seg[] = c.xrpl === me ? ['Sent ', value, ` via ${bridge} to `, other] : [{ a: c.xrpl }, ' sent ', value, ` via ${bridge} to `, other];
-    return { icon: 'route', dir: c.xrpl === me ? 'out' : 'neutral', segs: [...segs, ...extra, ' ', DECLARED, ...mismatch] };
+    const segs: Seg[] = c.local === me ? ['Sent ', value, ` via ${bridge} to `, other] : [{ a: c.local }, ' sent ', value, ` via ${bridge} to `, other];
+    return { icon: 'route', dir: c.local === me ? 'out' : 'neutral', segs: [...segs, ...extra, ' ', DECLARED, ...mismatch] };
   }
-  const segs: Seg[] = c.xrpl === me ? ['Received ', value, ' from ', other, ` via ${bridge}`] : ['Released ', value, ' to ', { a: c.xrpl }, ' from ', other];
-  return { icon: 'route', dir: c.xrpl === me ? 'in' : 'neutral', segs: [...segs, ...extra, ' ', DECLARED] };
+  const segs: Seg[] = c.local === me ? ['Received ', value, ' from ', other, ` via ${bridge}`] : ['Released ', value, ' to ', { a: c.local }, ' from ', other];
+  return { icon: 'route', dir: c.local === me ? 'in' : 'neutral', segs: [...segs, ...extra, ' ', DECLARED] };
+}
+
+function remitted(p: ParsedTx, amt: (a: unknown) => Seg): Seg[] {
+  const list: Seg[] = (p.tx.Amounts ?? []).map((e: any) => amt(e.AmountEntry?.Amount));
+  if (p.tx.URITokenIDs?.length) list.push(`${p.tx.URITokenIDs.length} URI token${p.tx.URITokenIDs.length > 1 ? 's' : ''}`);
+  if (!list.length) return ['funds'];
+  return list.flatMap((x, i) => (i ? [i === list.length - 1 ? ' and ' : ', ', x] : [x]));
 }

@@ -4,7 +4,7 @@
  * Every claim keeps its source so the UI can show where a name came from.
  */
 import { shortAddr } from '../xrpl/amount';
-import { extLabel, isChainHub, isExternal } from '../bridges/registry';
+import { extLabel, isChainHub, isExternal, parseExt, shortForeign } from '../bridges/registry';
 
 export interface KnownEntry {
   name: string;
@@ -38,6 +38,8 @@ export interface Identity {
   kyc?: boolean;
   userLabel?: string;
   userNote?: string;
+  /** Label of one of the user's own wallets (local wallet manager, mainnet only). */
+  walletName?: string;
   light: 'none' | 'loading' | 'done';
   deep: 'none' | 'loading' | 'done';
   // raw source data
@@ -46,7 +48,7 @@ export interface Identity {
   xamanAlias?: { text: string; href?: string };
   thirdParty: { alias: string; source: string }[];
   /** Name derived from ledger facts (e.g. an AMM pool's two assets). */
-  derived?: { name: string; claim: string };
+  derived?: { name: string; claim: string; source: string };
 }
 
 export interface SearchHit {
@@ -71,6 +73,9 @@ const BLACKHOLE_NAMES: Record<string, string> = {
   rrrrrrrrrrrrrrrrrrrrBZbvji: 'Black hole (one)',
   rrrrrrrrrrrrrrrrrrrn5RM1rHd: 'Black hole (NaN)',
 };
+
+/** Networks GraphXRP reads directly (identities work there; others only get a chain label). */
+const CONNECTED = new Set(['xahau', 'xrpl-evm']);
 
 const CACHE_KEY = 'gx.directory.v1';
 const LABELS_KEY = 'gx.labels.v1';
@@ -166,6 +171,7 @@ export class Directory {
 
   private ids = new Map<string, Identity>();
   private labels: Record<string, { label?: string; note?: string }> = readStore(LABELS_KEY) ?? {};
+  private walletNames = new Map<string, string>();
   private listeners = new Set<(addr: string) => void>();
   private lightPool = new Pool(2, 250);
   private deepPool = new Pool(2, 400);
@@ -227,9 +233,10 @@ export class Directory {
 
   /** Short label for the graph. */
   label(addr: string): string {
-    if (isExternal(addr)) return extLabel(addr);
+    const ext = isExternal(addr) ? parseExt(addr) : null;
+    if (ext && !CONNECTED.has(ext.chain)) return extLabel(addr);
     const id = this.get(addr);
-    if (!id.name) return shortAddr(addr);
+    if (!id.name) return ext?.address ? (ext.chain === 'xahau' ? shortAddr(ext.address) : shortForeign(ext.address)) : shortAddr(addr);
     const full = id.tag ? `${id.name} ${id.tag}` : id.name;
     return full.length > 28 ? `${full.slice(0, 27).trimEnd()}\u2026` : full;
   }
@@ -239,11 +246,34 @@ export class Directory {
     if (!id) return;
     this.recompute(id);
     this.emit(addr);
+    // The same address on Xahau shares this identity (same keys).
+    const twin = `ext:xahau:${addr}`;
+    if (!isExternal(addr) && this.ids.has(twin)) this.refresh(twin);
   }
 
   private recompute(id: Identity) {
     const addr = id.address;
     if (isExternal(addr)) {
+      const { chain, address } = parseExt(addr);
+      if (chain === 'xahau' && address) {
+        // Same r-address = same master key, so the XRP Ledger identity carries over.
+        const base = this.get(address);
+        Object.assign(id, { name: base.name, tag: base.tag, advisory: base.advisory, xamanBlocked: base.xamanBlocked, avatar: base.avatar, kyc: base.kyc, twitter: base.twitter, walletName: base.walletName });
+        id.userLabel = base.userLabel;
+        id.userNote = base.userNote;
+        id.claims = base.claims.map((c) => ({ ...c, source: `${c.source} \u00b7 for the same address on the XRP Ledger` }));
+        return;
+      }
+      if (chain === 'xrpl-evm' && address) {
+        const lab = this.labels[addr];
+        id.userLabel = lab?.label || undefined;
+        id.userNote = lab?.note || undefined;
+        id.name = id.userLabel ?? id.derived?.name;
+        id.claims = [];
+        if (id.userLabel) id.claims.push({ source: 'Your label', text: id.userLabel });
+        if (id.derived) id.claims.push({ source: id.derived.source, text: id.derived.claim });
+        return;
+      }
       // Addresses on other chains: no directories to ask yet (only the chain name, for chain hubs).
       id.name = isChainHub(addr) ? extLabel(addr) : undefined;
       id.claims = [];
@@ -254,11 +284,13 @@ export class Directory {
     const lab = this.labels[addr];
     id.userLabel = lab?.label || undefined;
     id.userNote = lab?.note || undefined;
+    id.walletName = this.walletNames.get(addr);
 
     const k = id.known;
     const desc = k?.desc?.trim();
     id.tag = undefined;
     if (id.userLabel) id.name = id.userLabel;
+    else if (id.walletName) id.name = id.walletName;
     else if (BLACKHOLE_NAMES[addr]) id.name = BLACKHOLE_NAMES[addr];
     else if (k) {
       id.name = k.name;
@@ -276,6 +308,7 @@ export class Directory {
 
     const claims: Claim[] = [];
     if (id.userLabel) claims.push({ source: 'Your label', text: id.userLabel });
+    if (id.walletName) claims.push({ source: 'Your wallet', text: id.walletName });
     if (k) {
       claims.push({
         source: 'XRPScan directory',
@@ -286,7 +319,7 @@ export class Directory {
     } else if (id.scanName?.name) {
       claims.push({ source: 'XRPScan', text: id.scanName.name, verified: !!id.scanName.verified, href: `https://xrpscan.com/account/${addr}` });
     }
-    if (id.derived) claims.push({ source: 'XRP Ledger', text: id.derived.claim, verified: true });
+    if (id.derived) claims.push({ source: id.derived.source, text: id.derived.claim, verified: id.derived.source === 'XRP Ledger' });
     if (id.xamanAlias) claims.push({ source: 'Xaman profile', text: id.xamanAlias.text, href: id.xamanAlias.href });
     const seen = new Set(claims.map((c) => `${c.source}|${c.text}`));
     for (const t of id.thirdParty) {
@@ -407,20 +440,29 @@ export class Directory {
     });
   }
 
-  setDerived(addr: string, name: string, claim: string) {
+  setDerived(addr: string, name: string, claim: string, source = 'XRP Ledger') {
     const id = this.get(addr);
     if (id.derived?.name === name) return;
-    id.derived = { name, claim };
+    id.derived = { name, claim, source };
     this.refresh(addr);
   }
 
   setLabel(addr: string, label: string, note?: string) {
+    // A label on a Xahau address belongs to the same keys as on the XRP Ledger.
+    if (addr.startsWith('ext:xahau:')) addr = addr.slice('ext:xahau:'.length);
     const l = label.trim();
     const n = note?.trim();
     if (!l && !n) delete this.labels[addr];
     else this.labels[addr] = { label: l || undefined, note: n || undefined };
     writeStore(LABELS_KEY, this.labels);
     this.refresh(addr);
+  }
+
+  /** Names for the user's own wallets; they show on the map like private labels. */
+  setWalletNames(names: Map<string, string>) {
+    const touched = new Set([...this.walletNames.keys(), ...names.keys()]);
+    this.walletNames = new Map(names);
+    for (const addr of touched) this.refresh(addr);
   }
 
   search(q: string, limit = 8): SearchHit[] {

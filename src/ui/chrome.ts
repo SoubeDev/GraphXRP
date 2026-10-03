@@ -4,6 +4,7 @@ import { h, clear } from './dom';
 import { icon, shapeGlyph } from './icons';
 import { isAddress, isTxHash, shortAddr } from '../xrpl/amount';
 import { isExternal, parseExt } from '../bridges/registry';
+import { nodeId } from '../chains/chains';
 
 const FOREIGN_RE = /^(0x[0-9a-fA-F]{40}|core1[02-9ac-hj-np-z]{38,58})$/;
 
@@ -57,7 +58,7 @@ function buildSearch(app: App): HTMLElement {
   const input = h('input', {
     type: 'search',
     class: 'search-input',
-    placeholder: 'Search a name, website, address or transaction…',
+    placeholder: 'Search a name, website, address (r… or 0x…) or transaction…',
     'aria-label': 'Search the XRP Ledger',
     autocomplete: 'off',
     spellcheck: 'false',
@@ -132,9 +133,24 @@ function buildSearch(app: App): HTMLElement {
     const q = input.value.trim();
     results = [];
     active = 0;
+    // Your own wallets (local wallet manager) come first.
+    const extra = q.length >= 2 ? (app.ext.search?.(q) ?? []).slice(0, 4) : [];
+    for (const x of extra) results.push({ ...x, onMap: false });
+    const mine = new Set(extra.map((x) => x.address));
     if (isAddress(q)) {
       const named = app.dir.get(q).name;
-      results.push({ title: named ? app.dir.label(q) : 'Explore this address', sub: q, kind: app.classify(q), onMap: app.model.nodes.has(q), run: () => void app.explore(q) });
+      results.push({ title: named ? app.dir.label(q) : 'Explore this address', sub: `${q} \u00b7 XRP Ledger`, kind: app.classify(q), onMap: app.model.nodes.has(q), run: () => void app.explore(q) });
+      // Xahau uses the same addresses (and the same keys).
+      const x = nodeId('xahau', q);
+      results.push({ title: 'Same address on Xahau', sub: `${q} \u00b7 Xahau`, kind: 'wallet', onMap: app.model.nodes.has(x), run: () => void app.explore(x) });
+    } else if (/^0x[0-9a-fA-F]{40}$/.test(q)) {
+      const id = nodeId('xrpl-evm', q);
+      results.push({ title: app.dir.get(id).name ?? 'Explore on the XRPL EVM Sidechain', sub: `${q.toLowerCase()} \u00b7 XRPL EVM Sidechain`, kind: app.classify(id), onMap: app.model.nodes.has(id), run: () => void app.explore(id) });
+      const low = q.toLowerCase();
+      for (const other of app.model.nodes.keys()) {
+        if (other === id || !isExternal(other) || parseExt(other).address?.toLowerCase() !== low) continue;
+        results.push({ title: app.dir.label(other), sub: 'Same address on another chain \u00b7 on the map', kind: 'external', onMap: true, run: () => (app.select(other), app.view.focusNode(other)) });
+      }
     } else if (isTxHash(q)) {
       results.push({ title: 'Open this transaction', sub: `${q.slice(0, 20)}…`, kind: 'wallet', run: () => void app.openTx(q.toUpperCase()) });
     } else if (FOREIGN_RE.test(q)) {
@@ -154,6 +170,7 @@ function buildSearch(app: App): HTMLElement {
       }
     } else if (q.length >= 2) {
       for (const hit of app.dir.search(q, 8)) {
+        if (mine.has(hit.address)) continue;
         results.push({
           title: hit.name,
           tag: hit.tag,
@@ -249,6 +266,14 @@ function buildStatus(app: App): HTMLElement {
     }
   };
   app.client.onChange(render);
+  // Other networks connect on demand; show them next to the XRP Ledger once they do.
+  const others = h('span', { class: 'status-others' });
+  el.append(others);
+  app.on('networks', () => {
+    const x = app.xahauConnected;
+    others.textContent = x ? ` \u00b7 Xahau ${x.state === 'connected' ? (x.ledgerIndex ? x.ledgerIndex.toLocaleString() : 'live') : '\u2026'}` : '';
+    others.title = x ? `Also connected to Xahau via ${x.server}` : '';
+  });
   render();
   return el;
 }

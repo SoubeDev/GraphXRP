@@ -46,6 +46,18 @@ const P: Record<string, string> = {
   menu: '<path d="M4 12h16"/><path d="M4 6h16"/><path d="M4 18h16"/>',
   panel: '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/>',
   sparkle: '<path d="M12 3l1.9 5.8L20 10l-6.1 1.2L12 17l-1.9-5.8L4 10l6.1-1.2z"/>',
+  wallet: '<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/>',
+  send: '<path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/>',
+  eye: '<path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/>',
+  unlock: '<rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>',
+  more: '<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
+  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>',
+  code: '<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>',
+  pencil: '<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/>',
+  down: '<path d="m6 9 6 6 6-6"/>',
+  tick: '<path d="M20 6 9 17l-5-5"/>',
 };
 
 export function icon(name: string, size = 16, cls = ''): SVGSVGElement {
@@ -59,7 +71,13 @@ export function shapeGlyph(kind: string, size = 14): SVGSVGElement {
   const c = size / 2;
   const r = size * 0.32;
   let shape: string;
-  if (kind === 'bridge' || kind === 'external') {
+  if (kind === 'contract') {
+    const pts = Array.from({ length: 5 }, (_, i) => {
+      const a = -Math.PI / 2 + (i * 2 * Math.PI) / 5;
+      return `${(c + Math.cos(a) * r * 1.18).toFixed(2)},${(c + Math.sin(a) * r * 1.18).toFixed(2)}`;
+    }).join(' ');
+    shape = `<polygon points="${pts}"/>`;
+  } else if (kind === 'bridge' || kind === 'external') {
     const d = r * 1.4;
     shape = `<path d="M${c} ${c - d} L${c + d * 0.866} ${c + d * 0.5} L${c - d * 0.866} ${c + d * 0.5} Z"/>`;
   } else if (kind === 'issuer') shape = `<path d="M${c} ${c - r * 1.3} L${c + r * 1.3} ${c} L${c} ${c + r * 1.3} L${c - r * 1.3} ${c} Z"/>`;
@@ -82,7 +100,7 @@ export function shapeGlyph(kind: string, size = 14): SVGSVGElement {
 
 /** A short line sample with the edge's dash pattern (used in legends). */
 export function lineGlyph(type: string, width = 22): SVGSVGElement {
-  const dash: Record<string, string> = { payment: 'none', activation: 'none', trust: '1.5 3', dex: '5 3', control: '6 2 2 2', crosschain: '7 3' };
+  const dash: Record<string, string> = { payment: 'none', activation: 'none', trust: '1.5 3', dex: '5 3', control: '6 2 2 2', crosschain: '7 3', contract: '2 2.5' };
   const wrap = document.createElement('span');
   wrap.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="10" viewBox="0 0 ${width} 10" class="glyph" aria-hidden="true"><line x1="1" y1="5" x2="${width - 1}" y2="5" stroke="var(--e-${type})" stroke-width="${type === 'activation' ? 2.2 : 1.8}" stroke-linecap="round" stroke-dasharray="${dash[type]}"/></svg>`;
   return wrap.firstChild as SVGSVGElement;

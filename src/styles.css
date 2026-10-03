@@ -25,6 +25,8 @@
   --k-flagged: #d03b3b;
   --k-inactive: #a9a8a2;
   --k-bridge: #0b0b0b;
+  --k-contract: #6a6964;
+  --e-contract: #8a8984;
   --k-external: #0b0b0b;
   --e-crosschain: #0b0b0b;
   --e-payment: #8a8984;
@@ -71,6 +73,8 @@
     --k-flagged: #d03b3b;
     --k-inactive: #6b6a66;
     --k-bridge: #f2f2f0;
+    --k-contract: #b1b0aa;
+    --e-contract: #8b8a85;
     --k-external: #f2f2f0;
     --e-crosschain: #f2f2f0;
     --e-payment: #8b8a85;
@@ -109,6 +113,8 @@
   --k-flagged: #d03b3b;
   --k-inactive: #6b6a66;
   --k-bridge: #f2f2f0;
+  --k-contract: #b1b0aa;
+  --e-contract: #8b8a85;
   --k-external: #f2f2f0;
   --e-crosschain: #f2f2f0;
   --e-payment: #8b8a85;
@@ -872,6 +878,18 @@ kbd {
 .chip-acct:not(.named) span {
   font: 400 11.5px var(--mono);
 }
+.chip-net {
+  font: 600 9.5px var(--font) !important;
+  letter-spacing: 0.03em;
+  padding: 0 4px;
+  border-radius: 3px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-2);
+  flex: none;
+}
+.status-others {
+  color: var(--muted);
+}
 .chip-acct:hover {
   border-color: var(--text-2);
 }
@@ -895,6 +913,71 @@ kbd {
   color: var(--text-2);
   cursor: help;
   white-space: nowrap;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  vertical-align: middle;
+}
+.badge.ok {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--good) 45%, transparent);
+  color: var(--good);
+  background: var(--good-bg);
+}
+.badge.warn {
+  border-style: solid;
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  color: var(--warn);
+  background: var(--warn-bg);
+}
+.badge.checking {
+  color: var(--muted);
+}
+.spinner.tiny {
+  width: 8px;
+  height: 8px;
+  border-width: 1.5px;
+  margin: 0;
+}
+.net-chip {
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-2);
+  margin-left: 2px;
+  cursor: help;
+}
+.twin {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 6px;
+  align-items: start;
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  font-size: 13px;
+}
+.twin > svg {
+  margin-top: 3px;
+  color: var(--text-2);
+}
+.net-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  justify-self: center;
+  background: color-mix(in srgb, var(--text) 18%, transparent);
+  border: 1px solid var(--muted);
+}
+.net-dot.off-net {
+  background: none;
+  border-style: dashed;
 }
 .mono {
   font-family: var(--mono);

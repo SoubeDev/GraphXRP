@@ -2,11 +2,14 @@
 import type { SimulationLinkDatum, SimulationNodeDatum } from 'd3-force';
 import type { EdgeType } from '../xrpl/parse';
 import type { Amt } from '../xrpl/amount';
+import { chainOf } from '../chains/chains';
 
-export type NodeKind = 'issuer' | 'exchange' | 'amm' | 'bridge' | 'wallet' | 'external' | 'flagged' | 'inactive';
+export type NodeKind = 'issuer' | 'exchange' | 'amm' | 'bridge' | 'contract' | 'wallet' | 'external' | 'flagged' | 'inactive';
 
 export interface GNode extends SimulationNodeDatum {
   id: string;
+  /** Network the node lives on ('xrpl', 'xahau', 'xrpl-evm', or an unconnected chain). */
+  chain: string;
   kind: NodeKind;
   named: boolean;
   state: 'stub' | 'loading' | 'loaded' | 'error';
@@ -37,6 +40,8 @@ export interface GEdge extends SimulationLinkDatum<GNode> {
   ab: Leg;
   ba: Leg;
   seen: Set<string>;
+  /** Cross-chain flows confirmed on the other network (subset of `seen`). */
+  confirmed: Set<string>;
   role?: string;
   curve: number;
   born: number;
@@ -62,6 +67,7 @@ export class GraphModel {
     const dist = near ? 30 + Math.random() * 50 : Math.random() * 40;
     n = {
       id,
+      chain: chainOf(id),
       kind: 'wallet',
       named: false,
       state: 'stub',
@@ -91,7 +97,7 @@ export class GraphModel {
     if (e) return e;
     const na = this.ensure(a);
     const nb = this.ensure(b);
-    e = { id, type, a, b, ab: newLeg(), ba: newLeg(), seen: new Set(), curve: 0, born: performance.now(), alpha: 1, source: na, target: nb };
+    e = { id, type, a, b, ab: newLeg(), ba: newLeg(), seen: new Set(), confirmed: new Set(), curve: 0, born: performance.now(), alpha: 1, source: na, target: nb };
     this.edges.set(id, e);
     this.adj.get(a)!.add(e);
     this.adj.get(b)!.add(e);
@@ -123,6 +129,14 @@ export class GraphModel {
     const amount: Amt = { value: balance, currency, issuer, isXrp: false };
     leg.totals.set(amtKey(amount), amount);
     leg.count = leg.totals.size;
+    return e;
+  }
+
+  /** Mark one cross-chain flow as confirmed on the other network. */
+  confirm(from: string, to: string, key: string): GEdge | undefined {
+    const [a, b] = from < to ? [from, to] : [to, from];
+    const e = this.edges.get(`crosschain:${a}:${b}`);
+    if (e && e.seen.has(key)) e.confirmed.add(key);
     return e;
   }
 

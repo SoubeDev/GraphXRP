@@ -6,7 +6,8 @@ import { icon, shapeGlyph, lineGlyph } from './icons';
 import { EDGE_HINT, EDGE_LABEL } from './panels';
 import { fmtNum, fmtXrp, fmtDate, shortAddr } from '../xrpl/amount';
 import type { GEdge, GNode, Leg } from '../graph/model';
-import { chainName, explorerFor, isExternal, parseExt } from '../bridges/registry';
+import { chainName, explorerFor, parseExt } from '../bridges/registry';
+import { NETWORKS, chainOf, isLoadable, rawAddress, type Network } from '../chains/chains';
 
 /* ------------------------------- tooltip ------------------------------- */
 
@@ -32,7 +33,7 @@ export function buildTooltip(app: App): HTMLElement {
 }
 
 function nodeTip(app: App, n: GNode): Node[] {
-  if (isExternal(n.id)) {
+  if (!isLoadable(n.id)) {
     const { chain, address } = parseExt(n.id);
     const count = app.crossLog.get(n.id)?.size ?? 0;
     return [
@@ -44,11 +45,12 @@ function nodeTip(app: App, n: GNode): Node[] {
     ].filter((x): x is HTMLDivElement => !!x);
   }
   const ident = app.dir.get(n.id);
+  const chain = chainOf(n.id);
   const out: Node[] = [
-    h('div', { class: 'tt-title' }, ident.name ? app.dir.label(n.id) : shortAddr(n.id), ident.claims.some((c) => c.verified) ? h('span', { class: 'verified' }, icon('checkCircle', 12)) : null),
-    h('div', { class: 'tt-kind' }, shapeGlyph(n.kind, 11), KIND_LABEL[n.kind]),
+    h('div', { class: 'tt-title' }, ident.name || chain !== 'xrpl' ? app.dir.label(n.id) : shortAddr(n.id), ident.claims.some((c) => c.verified) ? h('span', { class: 'verified' }, icon('checkCircle', 12)) : null),
+    h('div', { class: 'tt-kind' }, shapeGlyph(n.kind, 11), KIND_LABEL[n.kind], chain !== 'xrpl' ? ` \u00b7 ${NETWORKS[chain as Network].name}` : ''),
   ];
-  if (ident.name) out.push(h('div', { class: 'tt-addr' }, n.id));
+  if (ident.name || chain !== 'xrpl') out.push(h('div', { class: 'tt-addr' }, rawAddress(n.id)));
   const facts: string[] = [];
   if (n.balance != null) facts.push(fmtXrp(n.balance));
   facts.push(`${n.degree} link${n.degree === 1 ? '' : 's'} on map`);
@@ -83,7 +85,7 @@ function legText(app: App, e: GEdge, from: string, to: string, leg: Leg): Node |
       text = `${A} can sign for ${B}${e.role ? ` (${e.role})` : ''}`;
       break;
     case 'crosschain':
-      text = `${A} \u2192 ${B}: ${leg.count} cross-chain transfer${leg.count > 1 ? 's' : ''}${amounts ? ` \u00b7 ${amounts}${more}` : ''} (declared)`;
+      text = `${A} \u2192 ${B}: ${leg.count} cross-chain transfer${leg.count > 1 ? 's' : ''}${amounts ? ` \u00b7 ${amounts}${more}` : ''}${e.confirmed.size ? ` (${e.confirmed.size >= e.seen.size ? 'confirmed' : `${e.confirmed.size} of ${e.seen.size} confirmed`} on the other network)` : ' (declared)'}`;
       break;
     default:
       text = `${A} ↔ ${B}: traded ${leg.count} time${leg.count > 1 ? 's' : ''}`;
@@ -126,7 +128,7 @@ export function buildContextMenu(app: App, openHelp: () => void): HTMLElement {
 
   app.onContext = (id, x, y) => {
     clear(el);
-    if (id && isExternal(id)) {
+    if (id && !isLoadable(id)) {
       const { chain, address } = parseExt(id);
       const n = app.model.nodes.get(id)!;
       const ex = address ? explorerFor(chain, address) : undefined;
@@ -142,26 +144,37 @@ export function buildContextMenu(app: App, openHelp: () => void): HTMLElement {
       );
     } else if (id) {
       const n = app.model.nodes.get(id)!;
+      const chain = chainOf(id) as Network;
+      const raw = rawAddress(id);
+      const xrplStyle = chain !== 'xrpl-evm';
       el.append(
         h('div', { class: 'ctx-title' }, app.dir.label(id)),
         item('info', 'Open details', () => app.select(id)),
         item('network', n.expanded ? 'Collapse connections' : 'Show connections', () => (n.expanded ? app.collapse(id) : void app.expand(id))),
-        item('sprout', 'Trace origin', () => {
-          app.select(id);
-          void app.traceOrigin(id);
-        }),
-        item('route', 'Follow the money', () => {
-          app.select(id);
-          void app.traceFunding(id);
-        }),
+        xrplStyle
+          ? item('sprout', 'Trace origin', () => {
+              app.select(id);
+              void app.traceOrigin(id);
+            })
+          : '',
+        xrplStyle
+          ? item('route', 'Follow the money', () => {
+              app.select(id);
+              void app.traceFunding(id);
+            })
+          : '',
         h('div', { class: 'ctx-sep' }),
         item('crosshair', 'Center here', () => app.view.focusNode(id)),
         item('pin', n.pinned ? 'Unpin' : 'Pin in place', () => app.view.togglePin(id)),
         item('eyeoff', 'Hide', () => app.hide(id)),
         h('div', { class: 'ctx-sep' }),
-        item('copy', 'Copy address', async () => (await copyText(id)) && app.toast('Address copied')),
-        item('external', 'Open in XRPScan', () => window.open(`https://xrpscan.com/account/${id}`, '_blank', 'noopener')),
+        item('copy', 'Copy address', async () => (await copyText(raw)) && app.toast('Address copied')),
+        chain === 'xrpl'
+          ? item('external', 'Open in XRPScan', () => window.open(`https://xrpscan.com/account/${id}`, '_blank', 'noopener'))
+          : item('external', `Open in ${NETWORKS[chain].explorer.name}`, () => window.open(NETWORKS[chain].explorer.account(raw), '_blank', 'noopener')),
       );
+      const extra = app.ext.contextItems?.(id) ?? [];
+      if (extra.length) el.append(h('div', { class: 'ctx-sep' }), ...extra.map((x) => item(x.icon, x.label, x.run)));
     } else {
       el.append(
         item('fit', 'Fit everything', () => app.view.fit()),
@@ -200,6 +213,8 @@ const STARTERS: { label: string; note: string; addr: string; kind: string }[] = 
   { label: 'Sologenic (SOLO)', note: 'blackholed issuer', addr: 'rsoLo2S1kiGeCcn6hCUXVrCpGMWLrRrLZz', kind: 'issuer' },
   { label: 'Axelar bridge', note: 'to XRPL EVM & Ethereum', addr: 'rfmS3zqrQrka8wVyhXifEeyTwe8AMz2Yhw', kind: 'bridge' },
   { label: 'Genesis account', note: 'where XRP began', addr: 'rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh', kind: 'wallet' },
+  { label: 'XAH Teleport', note: 'XRP Ledger \u2194 Xahau', addr: 'rTeLeproT3BVgjWoYrDYpKbBLXPaVMkge', kind: 'bridge' },
+  { label: 'Axelar on XRPL EVM', note: 'the bridge\u2019s other side', addr: 'ext:xrpl-evm:0xb5fb4be02232b1bba4dc8f81dc24c26980de9e3c', kind: 'bridge' },
 ];
 
 export function buildWelcome(app: App, openHelp: () => void): HTMLElement {
@@ -255,7 +270,8 @@ export function buildHelp(): { el: HTMLElement; open: () => void } {
     ['flagged', 'Flagged', 'A public directory reported it (scam, hack, spam). Labels marked with ⚠.'],
     ['inactive', 'Inactive', 'No account exists there now: deleted, or never funded.'],
     ['bridge', 'Bridge door', 'Run by a cross-chain bridge. Funds sent here leave the XRP Ledger for another blockchain.'],
-    ['external', 'On another chain', 'An address on a different blockchain, named in an XRP Ledger transaction. Shown as an outline because it can\u2019t be opened here yet.'],
+    ['contract', 'Smart contract', 'A program on the XRPL EVM Sidechain, such as a token or a bridge contract.'],
+    ['external', 'On another chain', 'An address on a blockchain GraphXRP can\u2019t read yet, named in a transaction. Shown as an outline.'],
   ];
   const edges: [string, string][] = [
     ['payment', 'Payments. Dots travel in the direction the money went; thicker = more transfers.'],
@@ -263,7 +279,8 @@ export function buildHelp(): { el: HTMLElement; open: () => void } {
     ['trust', 'Token holding. Points from a holder to the issuer whose token it holds.'],
     ['dex', 'Trading. The two traded on the built-in exchange or with an AMM pool.'],
     ['control', 'Control. One account holds a key that can sign for the other.'],
-    ['crosschain', 'Crossed chains. Funds headed to (or arriving from) another blockchain, as declared in the transaction.'],
+    ['crosschain', 'Crossed chains. Dashed: declared in the transaction. Solid: confirmed on the other network.'],
+    ['contract', 'Used a smart contract. One address called a program on the XRPL EVM Sidechain.'],
   ];
   dlg.append(
     h(
@@ -279,6 +296,12 @@ export function buildHelp(): { el: HTMLElement; open: () => void } {
           h('h3', null, 'Accounts'),
           h('ul', { class: 'help-list' }, ...kinds.map(([k, t, d]) => h('li', null, shapeGlyph(k, 16), h('div', null, h('strong', null, t), h('p', null, d))))),
           h('p', { class: 'muted small' }, 'A ring around a shape means someone publicly named it. Faded shapes haven’t been opened yet: click one to look it up.'),
+          h('h3', null, 'Networks'),
+          h(
+            'p',
+            { class: 'muted small' },
+            'Each network gets its own island: the XRP Ledger in the middle, Xahau and the XRPL EVM Sidechain beside it, and chains GraphXRP can’t read yet (dashed outline) on the far side. Lines between islands are bridges. The same r-address on the XRP Ledger and Xahau is linked: same address, same keys.',
+          ),
         ),
         h(
           'section',
